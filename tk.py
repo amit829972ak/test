@@ -167,7 +167,7 @@ st.markdown("""
 def setup_gemini():
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]  # Store your API key in Streamlit secrets
     genai.configure(api_key=GOOGLE_API_KEY)
-    return genai.GenerativeModel('gemini-1.5-pro')  # Choose the appropriate model
+    return genai.GenerativeModel('Gemini 1.5 Flash Latest')  # Choose the appropriate model
 
 # Load spaCy model globally
 @st.cache_resource
