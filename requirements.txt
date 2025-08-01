@@ -1,19 +1,7 @@
-streamlit==1.42.0
-spaCy==3.7.2
-dateparser
-requests
-openai
-pip==25.0.1
-pandas==1.5.3
-matplotlib
-timedelta
-datetime
-numpy==1.23.5
-watchdog
-google-generativeai
-word2number
-setuptools
-wheel
-geonamescache
-spacy-lookups-data  # Required for some spaCy models
-en-core-web-trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.0/en_core_web_trf-3.7.0-py3-none-any.whl
+streamlit>=1.28.0
+spacy>=3.7.0
+dateparser>=1.1.8
+pandas>=2.0.0
+google-generativeai>=0.3.0
+geonamescache>=1.6.0
+word2number>=1.1
