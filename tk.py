@@ -177,7 +177,7 @@ def load_spacy_model():
     try:
         return spacy.load("en_core_web_sm")
     except OSError:
-        st.error("spaCy English model not found. Please install it using: python -m spacy download en_core_web_sm")
+        st.error("spaCy English model not found. Please install it using: python -m spacy download en_core_web_trf")
         st.stop()
 
 nlp = load_spacy_model()
