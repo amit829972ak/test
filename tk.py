@@ -10,6 +10,7 @@ import geonamescache
 from word2number import w2n
 import json
 import google.generativeai as genai
+import traceback
 
 # Configure the Streamlit page
 st.set_page_config(
@@ -165,14 +166,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def setup_gemini():
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]  # Store your API key in Streamlit secrets
+    import os
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "default_key")
     genai.configure(api_key=GOOGLE_API_KEY)
-    return genai.GenerativeModel('Gemini 1.5 Flash Latest')  # Choose the appropriate model
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 # Load spaCy model globally
 @st.cache_resource
 def load_spacy_model():
-    return spacy.load("en_core_web_trf")
+    try:
+        return spacy.load("en_core_web_sm")
+    except OSError:
+        st.error("spaCy English model not found. Please install it using: python -m spacy download en_core_web_sm")
+        st.stop()
 
 nlp = load_spacy_model()
 
@@ -249,6 +255,64 @@ def extract_details(text):
 
     # Construct final details dictionary
     details = {}
+    if start_location:
+        details["Starting Location"] = start_location
+    if destination:
+        details["Destination"] = destination
+
+    # Enhanced destination extraction for complex travel patterns
+    def extract_advanced_destinations(text, current_start, current_dest):
+        """Handle complex patterns like 'from india to china, to japan from nepal' or 'to thailand'"""
+        
+        # Pattern 1: Complex multi-destination "from X to Y, to Z from W"
+        complex_pattern = r'from\s+([a-zA-Z\s]+?)\s+to\s+([a-zA-Z\s]+?)(?:,\s*to\s+([a-zA-Z\s]+?))?(?:\s+from\s+([a-zA-Z\s]+?))?'
+        complex_match = re.search(complex_pattern, text, re.IGNORECASE)
+        
+        if complex_match:
+            groups = complex_match.groups()
+            start_loc = groups[0].strip().title() if groups[0] else current_start
+            
+            destinations = []
+            for i in range(1, len(groups)):
+                if groups[i]:
+                    dest = groups[i].strip().title()
+                    if dest and dest not in destinations:
+                        destinations.append(dest)
+            
+            return start_loc, ", ".join(destinations) if destinations else current_dest
+        
+        # Pattern 2: Simple "to X" with multiple destinations
+        to_matches = re.findall(r'\bto\s+([a-zA-Z\s]+?)(?:\s|$|,)', text, re.IGNORECASE)
+        if to_matches:
+            destinations = []
+            for match in to_matches:
+                cleaned = match.strip().title()
+                # Remove common words that aren't locations
+                cleaned = re.sub(r'\b(And|Or|The|A|An|For|Days?|Weeks?|Months?)\b', '', cleaned).strip()
+                if len(cleaned) > 2 and cleaned not in destinations:
+                    destinations.append(cleaned)
+            if destinations:
+                return current_start, ", ".join(destinations)
+        
+        # Pattern 3: Visit/traveling patterns
+        visit_pattern = r'(?:visit|traveling to|going to)\s+([a-zA-Z\s,]+?)(?:\s+for|\s+in|\.|$)'
+        visit_match = re.search(visit_pattern, text, re.IGNORECASE)
+        if visit_match:
+            locations_str = visit_match.group(1)
+            destinations = []
+            for loc in locations_str.split(','):
+                cleaned = loc.strip().title()
+                if len(cleaned) > 2:
+                    destinations.append(cleaned)
+            if destinations:
+                return current_start, ", ".join(destinations)
+        
+        return current_start, current_dest
+    
+    # Apply enhanced extraction
+    start_location, destination = extract_advanced_destinations(text, start_location, destination)
+    
+    # Update details dictionary with enhanced results
     if start_location:
         details["Starting Location"] = start_location
     if destination:
@@ -350,641 +414,469 @@ def extract_details(text):
             return num * 7
         elif 'month' in unit:
             return num * 30
-        else:  # days
+        else:
             return num
     
-    # Process the matched patterns
+    # Extract and process dates based on different patterns
+    start_date = None
+    end_date = None
+    duration_value = None
+    
+    current_year = datetime.now().year
+    
+    # Try to match each pattern
     if ordinal_match:
-        # Handle format "from 3-13th april 2025"
-        start_day = ordinal_match.group(1)
-        end_day = ordinal_match.group(2)
-        month = ordinal_match.group(3)
-        year = ordinal_match.group(4) or datetime.today().year
+        # Pattern 1: "from 3-13th april 2025"
+        start_day = int(ordinal_match.group(1))
+        end_day = int(ordinal_match.group(2))
+        month_name = ordinal_match.group(3)
+        year = int(ordinal_match.group(4)) if ordinal_match.group(4) else current_year
         
-        start_date_text = f"{start_day} {month} {year}"
-        end_date_text = f"{end_day} {month} {year}"
-        
-        start_date = dateparser.parse(start_date_text, settings={'PREFER_DATES_FROM': 'future'})
-        end_date = dateparser.parse(end_date_text, settings={'PREFER_DATES_FROM': 'future'})
-        
-        if start_date and end_date:
-            details["Start Date"] = start_date.strftime('%Y-%m-%d')
-            details["End Date"] = end_date.strftime('%Y-%m-%d')
-            details["Trip Duration"] = f"{(end_date - start_date).days + 1} days"  # +1 to include both days
+        try:
+            start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %B %Y")
+            end_date = datetime.strptime(f"{end_day} {month_name} {year}", "%d %B %Y")
+            duration_value = (end_date - start_date).days + 1
+        except ValueError:
+            try:
+                start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %b %Y")
+                end_date = datetime.strptime(f"{end_day} {month_name} {year}", "%d %b %Y")
+                duration_value = (end_date - start_date).days + 1
+            except ValueError:
+                pass
     
     elif to_date_match:
-        # Handle format "from 22th june 2025 to 29th june 2025"
-        start_day = to_date_match.group(1)
+        # Pattern 2: "from 22th june 2025 to 29th june 2025"
+        start_day = int(to_date_match.group(1))
         start_month = to_date_match.group(2)
-        start_year = to_date_match.group(3) or datetime.today().year
+        start_year = int(to_date_match.group(3)) if to_date_match.group(3) else current_year
+        end_day = int(to_date_match.group(4))
+        end_month = to_date_match.group(5)
+        end_year = int(to_date_match.group(6)) if to_date_match.group(6) else current_year
         
-        end_day = to_date_match.group(4)
-        end_month = to_date_match.group(5) or start_month
-        end_year = to_date_match.group(6) or start_year
-        
-        start_date_text = f"{start_day} {start_month} {start_year}"
-        end_date_text = f"{end_day} {end_month} {end_year}"
-        
-        start_date = dateparser.parse(start_date_text, settings={'PREFER_DATES_FROM': 'future'})
-        end_date = dateparser.parse(end_date_text, settings={'PREFER_DATES_FROM': 'future'})
-        
-        if start_date and end_date:
-            details["Start Date"] = start_date.strftime('%Y-%m-%d')
-            details["End Date"] = end_date.strftime('%Y-%m-%d')
-            details["Trip Duration"] = f"{(end_date - start_date).days + 1} days"
+        try:
+            start_date = datetime.strptime(f"{start_day} {start_month} {start_year}", "%d %B %Y")
+            end_date = datetime.strptime(f"{end_day} {end_month} {end_year}", "%d %B %Y")
+            duration_value = (end_date - start_date).days + 1
+        except ValueError:
+            try:
+                start_date = datetime.strptime(f"{start_day} {start_month} {start_year}", "%d %b %Y")
+                end_date = datetime.strptime(f"{end_day} {end_month} {end_year}", "%d %b %Y")
+                duration_value = (end_date - start_date).days + 1
+            except ValueError:
+                pass
     
     elif numeric_match:
-        # Handle format "from 02-04-2025 to 29-04-2025"
-        start_day = numeric_match.group(1)
-        start_month = numeric_match.group(2)
-        start_year = numeric_match.group(3)
+        # Pattern 3: "from 02-04-2025 to 29-04-2025"
+        start_day = int(numeric_match.group(1))
+        start_month = int(numeric_match.group(2))
+        start_year = int(numeric_match.group(3))
+        end_day = int(numeric_match.group(4))
+        end_month = int(numeric_match.group(5))
+        end_year = int(numeric_match.group(6))
         
-        end_day = numeric_match.group(4)
-        end_month = numeric_match.group(5)
-        end_year = numeric_match.group(6)
-        
-        start_date = datetime(int(start_year), int(start_month), int(start_day))
-        end_date = datetime(int(end_year), int(end_month), int(end_day))
-        
-        details["Start Date"] = start_date.strftime('%Y-%m-%d')
-        details["End Date"] = end_date.strftime('%Y-%m-%d')
-        details["Trip Duration"] = f"{(end_date - start_date).days + 1} days"
+        try:
+            start_date = datetime(start_year, start_month, start_day)
+            end_date = datetime(end_year, end_month, end_day)
+            duration_value = (end_date - start_date).days + 1
+        except ValueError:
+            pass
     
     elif date_for_duration_match:
-        # Handle format "from 12th march for two week"
-        day = date_for_duration_match.group(1)
-        month = date_for_duration_match.group(2)
-        year = date_for_duration_match.group(3) or datetime.today().year
+        # Pattern 4: "from 12th march for two week"
+        start_day = int(date_for_duration_match.group(1))
+        month_name = date_for_duration_match.group(2)
+        year = int(date_for_duration_match.group(3)) if date_for_duration_match.group(3) else current_year
         duration_num = convert_text_to_number(date_for_duration_match.group(4))
         duration_unit = date_for_duration_match.group(5)
         
-        start_date_text = f"{day} {month} {year}"
-        start_date = dateparser.parse(start_date_text, settings={'PREFER_DATES_FROM': 'future'})
-        
-        if start_date:
-            duration_days = convert_unit_to_days(duration_num, duration_unit)
-            end_date = start_date + timedelta(days=duration_days - 1)  # -1 to make duration inclusive of start day
-            
-            details["Start Date"] = start_date.strftime('%Y-%m-%d')
-            details["End Date"] = end_date.strftime('%Y-%m-%d')
-            details["Trip Duration"] = f"{duration_days} days"
+        try:
+            start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %B %Y")
+            duration_value = convert_unit_to_days(duration_num, duration_unit)
+            end_date = start_date + timedelta(days=duration_value - 1)
+        except ValueError:
+            try:
+                start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %b %Y")
+                duration_value = convert_unit_to_days(duration_num, duration_unit)
+                end_date = start_date + timedelta(days=duration_value - 1)
+            except ValueError:
+                pass
     
     elif duration_from_date_match:
-        # Handle format "for a week from 13th april"
+        # Pattern 5: "for a week from 13th april"
         duration_num = convert_text_to_number(duration_from_date_match.group(1))
         duration_unit = duration_from_date_match.group(2)
-        day = duration_from_date_match.group(3)
-        month = duration_from_date_match.group(4)
-        year = duration_from_date_match.group(5) or datetime.today().year
+        start_day = int(duration_from_date_match.group(3))
+        month_name = duration_from_date_match.group(4)
+        year = int(duration_from_date_match.group(5)) if duration_from_date_match.group(5) else current_year
         
-        start_date_text = f"{day} {month} {year}"
-        start_date = dateparser.parse(start_date_text, settings={'PREFER_DATES_FROM': 'future'})
-        
-        if start_date:
-            duration_days = convert_unit_to_days(duration_num, duration_unit)
-            end_date = start_date + timedelta(days=duration_days - 1)
-            
-            details["Start Date"] = start_date.strftime('%Y-%m-%d')
-            details["End Date"] = end_date.strftime('%Y-%m-%d')
-            details["Trip Duration"] = f"{duration_days} days"
+        try:
+            start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %B %Y")
+            duration_value = convert_unit_to_days(duration_num, duration_unit)
+            end_date = start_date + timedelta(days=duration_value - 1)
+        except ValueError:
+            try:
+                start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %b %Y")
+                duration_value = convert_unit_to_days(duration_num, duration_unit)
+                end_date = start_date + timedelta(days=duration_value - 1)
+            except ValueError:
+                pass
     
     elif duration_on_date_match:
-        # Handle format "for two weeks on 3rd april"
+        # Pattern 6: "for two weeks on 3rd april"
         duration_num = convert_text_to_number(duration_on_date_match.group(1))
         duration_unit = duration_on_date_match.group(2)
-        day = duration_on_date_match.group(3)
-        month = duration_on_date_match.group(4)
-        year = duration_on_date_match.group(5) or datetime.today().year
+        start_day = int(duration_on_date_match.group(3))
+        month_name = duration_on_date_match.group(4)
+        year = int(duration_on_date_match.group(5)) if duration_on_date_match.group(5) else current_year
         
-        start_date_text = f"{day} {month} {year}"
-        start_date = dateparser.parse(start_date_text, settings={'PREFER_DATES_FROM': 'future'})
-        
-        if start_date:
-            duration_days = convert_unit_to_days(duration_num, duration_unit)
-            end_date = start_date + timedelta(days=duration_days - 1)
-            
-            details["Start Date"] = start_date.strftime('%Y-%m-%d')
-            details["End Date"] = end_date.strftime('%Y-%m-%d')
-            details["Trip Duration"] = f"{duration_days} days"
+        try:
+            start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %B %Y")
+            duration_value = convert_unit_to_days(duration_num, duration_unit)
+            end_date = start_date + timedelta(days=duration_value - 1)
+        except ValueError:
+            try:
+                start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %b %Y")
+                duration_value = convert_unit_to_days(duration_num, duration_unit)
+                end_date = start_date + timedelta(days=duration_value - 1)
+            except ValueError:
+                pass
     
     elif on_date_for_duration_match:
-        # Handle format "on 13th march for a week"
-        day = on_date_for_duration_match.group(1)
-        month = on_date_for_duration_match.group(2)
-        year = on_date_for_duration_match.group(3) or datetime.today().year
+        # Pattern 7: "on 13th march for a week"
+        start_day = int(on_date_for_duration_match.group(1))
+        month_name = on_date_for_duration_match.group(2)
+        year = int(on_date_for_duration_match.group(3)) if on_date_for_duration_match.group(3) else current_year
         duration_num = convert_text_to_number(on_date_for_duration_match.group(4))
         duration_unit = on_date_for_duration_match.group(5)
         
-        start_date_text = f"{day} {month} {year}"
-        start_date = dateparser.parse(start_date_text, settings={'PREFER_DATES_FROM': 'future'})
-        
-        if start_date:
-            duration_days = convert_unit_to_days(duration_num, duration_unit)
-            end_date = start_date + timedelta(days=duration_days - 1)
-            
-            details["Start Date"] = start_date.strftime('%Y-%m-%d')
-            details["End Date"] = end_date.strftime('%Y-%m-%d')
-            details["Trip Duration"] = f"{duration_days} days"
+        try:
+            start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %B %Y")
+            duration_value = convert_unit_to_days(duration_num, duration_unit)
+            end_date = start_date + timedelta(days=duration_value - 1)
+        except ValueError:
+            try:
+                start_date = datetime.strptime(f"{start_day} {month_name} {year}", "%d %b %Y")
+                duration_value = convert_unit_to_days(duration_num, duration_unit)
+                end_date = start_date + timedelta(days=duration_value - 1)
+            except ValueError:
+                pass
     
     elif duration_on_numeric_date_match:
-        # Handle format "for 2 weeks on 20/05/2025" or "for two weeks on 02-08-2025"
+        # Pattern 8: "for 2 weeks on 20/05/2025"
         duration_num = convert_text_to_number(duration_on_numeric_date_match.group(1))
         duration_unit = duration_on_numeric_date_match.group(2)
-        day = duration_on_numeric_date_match.group(3)
-        month = duration_on_numeric_date_match.group(4)
-        year = duration_on_numeric_date_match.group(5)
+        start_day = int(duration_on_numeric_date_match.group(3))
+        start_month = int(duration_on_numeric_date_match.group(4))
+        start_year = int(duration_on_numeric_date_match.group(5))
         
         try:
-            start_date = datetime(int(year), int(month), int(day))
-            duration_days = convert_unit_to_days(duration_num, duration_unit)
-            end_date = start_date + timedelta(days=duration_days - 1)
-            
-            details["Start Date"] = start_date.strftime('%Y-%m-%d')
-            details["End Date"] = end_date.strftime('%Y-%m-%d')
-            details["Trip Duration"] = f"{duration_days} days"
+            start_date = datetime(start_year, start_month, start_day)
+            duration_value = convert_unit_to_days(duration_num, duration_unit)
+            end_date = start_date + timedelta(days=duration_value - 1)
         except ValueError:
-            # Handle potential date validation errors
             pass
     
     elif on_numeric_date_for_duration_match:
-        # Handle format "on 05/06/2025 for two weeks" or "on 06-07-2025 for 2 weeks"
-        day = on_numeric_date_for_duration_match.group(1)
-        month = on_numeric_date_for_duration_match.group(2)
-        year = on_numeric_date_for_duration_match.group(3)
+        # Pattern 9: "on 05/06/2025 for two weeks"
+        start_day = int(on_numeric_date_for_duration_match.group(1))
+        start_month = int(on_numeric_date_for_duration_match.group(2))
+        start_year = int(on_numeric_date_for_duration_match.group(3))
         duration_num = convert_text_to_number(on_numeric_date_for_duration_match.group(4))
         duration_unit = on_numeric_date_for_duration_match.group(5)
         
         try:
-            start_date = datetime(int(year), int(month), int(day))
-            duration_days = convert_unit_to_days(duration_num, duration_unit)
-            end_date = start_date + timedelta(days=duration_days - 1)
-            
-            details["Start Date"] = start_date.strftime('%Y-%m-%d')
-            details["End Date"] = end_date.strftime('%Y-%m-%d')
-            details["Trip Duration"] = f"{duration_days} days"
+            start_date = datetime(start_year, start_month, start_day)
+            duration_value = convert_unit_to_days(duration_num, duration_unit)
+            end_date = start_date + timedelta(days=duration_value - 1)
         except ValueError:
-            # Handle potential date validation errors
             pass
     
-    # If none of the specific patterns matched, fall back to existing date extraction logic
-    if not details.get("Start Date"):
-        # Enhanced regex for extracting date ranges in multiple formats
-        date_range_match = re.search(
-            r'(?P<start_day>\d{1,2})(?:st|nd|rd|th)?\s*(?P<start_month>[A-Za-z]+)?,?\s*(?P<start_year>\d{4})?\s*(?:-|from|on|to|through)\s*'
-            r'(?P<end_day>\d{1,2})(?:st|nd|rd|th)?\s*(?P<end_month>[A-Za-z]+)?,?\s*(?P<end_year>\d{4})?',
-            text, re.IGNORECASE
-)
+    # If none of the specific patterns matched, try general approaches
+    if not start_date and not end_date:
+        # Seasonal date matching 
+        for season, default_date in seasonal_mappings.items():
+            if season in text_lower:
+                year = current_year
+                try:
+                    start_date = datetime.strptime(f"{default_date}-{year}", "%m-%d-%Y")
+                    if duration_days:
+                        end_date = start_date + timedelta(days=duration_days - 1)
+                    else:
+                        end_date = start_date + timedelta(days=6)  # Default 7-day trip
+                        duration_value = 7
+                    break
+                except ValueError:
+                    continue
         
-    if seasonal_mappings:
-        for season, start_month_day in seasonal_mappings.items():
-            pattern = r'\b' + re.escape(season) + r'\b'
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                today = datetime.today().year
-                start_date = f"{today}-{start_month_day}"
-                details["Start Date"] = start_date
-                if "duration_days" in locals():
-                    details["End Date"] = (datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=duration_days)).strftime('%Y-%m-%d')
-                break  
+        # If seasonal matching failed, try dateparser as last resort
+        if not start_date:
+            try:
+                # Look for any date-like strings
+                dates_found = search_dates(text)
+                if dates_found:
+                    first_date = dates_found[0][1]
+                    start_date = first_date
+                    if duration_days:
+                        end_date = start_date + timedelta(days=duration_days - 1)
+            except:
+                pass
+    
+    # Set the details
+    if start_date:
+        details["Start Date"] = start_date.strftime("%Y-%m-%d")
+    if end_date:
+        details["End Date"] = end_date.strftime("%Y-%m-%d")
+    if duration_value and not details.get("Trip Duration"):
+        details["Trip Duration"] = f"{duration_value} days"
+    
+    # Extract budget
+    budget_pattern = r'(?:budget|spend|cost|price|money|funds)\s*(?:is|of)?\s*(?:around|about|approximately)?\s*[\$₹€£]?(\d+(?:,\d+)?(?:\.\d+)?)\s*(?:k|thousand|lakh|crore|million|billion)?'
+    budget_match = re.search(budget_pattern, text, re.IGNORECASE)
+    if budget_match:
+        budget_amount = budget_match.group(1)
+        # Check for currency symbols or mentions
+        if "₹" in text or "rupee" in text_lower or "inr" in text_lower:
+            currency = "₹"
+        elif "$" in text or "dollar" in text_lower or "usd" in text_lower:
+            currency = "$"
+        elif "€" in text or "euro" in text_lower:
+            currency = "€"
+        elif "£" in text or "pound" in text_lower or "gbp" in text_lower:
+            currency = "£"
+        else:
+            currency = "₹"  # Default to Indian Rupees
+        
+        # Handle scale modifiers
+        if "k" in text_lower or "thousand" in text_lower:
+            budget_amount = str(int(float(budget_amount) * 1000))
+        elif "lakh" in text_lower:
+            budget_amount = str(int(float(budget_amount) * 100000))
+        elif "crore" in text_lower:
+            budget_amount = str(int(float(budget_amount) * 10000000))
+        elif "million" in text_lower:
+            budget_amount = str(int(float(budget_amount) * 1000000))
+        elif "billion" in text_lower:
+            budget_amount = str(int(float(budget_amount) * 1000000000))
+        
+        details["Budget Range"] = f"{currency}{budget_amount}"
     
     # Extract number of travelers
-    travelers_match = re.search(r'(?P<adults>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:people|persons|adult|person|adults|man|men|woman|women|lady|ladies|climber|traveler)',text, re.IGNORECASE)
-    children_match = re.search(r'(?P<children>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:child|children)', text, re.IGNORECASE)
-    infants_match = re.search(r'(?P<infants>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:infant|infants)', text, re.IGNORECASE)
-
-    solo_match = re.search(r'\b(?:solo|alone|I|me)\b', text, re.IGNORECASE)
-    duo_match = re.search(r'\b(?:duo|honeymoon|couple|pair|my partner and I|my wife and I|my husband and I)\b', text, re.IGNORECASE)
-    trio_match = re.search(r'\btrio\b', text, re.IGNORECASE)
-    group_match = re.search(r'family of (\d+)|group of (\d+)', text, re.IGNORECASE)
-     
-    # Count occurrences of adult-related words
-    adult_words_match = len(re.findall(r'\b(?:man|men|woman|women|lady|ladies)\b', text, re.IGNORECASE))
-    number_words = {
-    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-    "six": "6", "seven": "7", "eight": "8", "nine": "9","ten": "10"}
-
-    # Convert written numbers for adults
-    num_adults_text = travelers_match.group("adults") if travelers_match else "0"
-    num_adults_text = number_words.get(num_adults_text.lower(), num_adults_text)
-    num_adults = int(num_adults_text)
-
-    # Convert written numbers for children
-    num_children_text = children_match.group("children") if children_match else "0"
-    num_children_text = number_words.get(num_children_text.lower(), num_children_text)
-    num_children = int(num_children_text)
-
-    # Convert written numbers for infants
-    num_infants_text = infants_match.group("infants") if infants_match else "0"
-    num_infants_text = number_words.get(num_infants_text.lower(), num_infants_text)
-    num_infants = int(num_infants_text)
-
-    travelers = {
-    "Adults": num_adults,
-    "Children": num_children,
-    "Infants": num_infants
-    }
-    
-    if solo_match:
-        travelers["Adults"] = 1
-    elif duo_match:
-        travelers["Adults"] = 2
-    elif trio_match:
-        travelers["Adults"] = 3
-    elif group_match:
-        total_people = int(group_match.group(1) or group_match.group(2))
-        if total_people > 2:
-            travelers["Adults"] = max(2, total_people - travelers["Children"] - travelers["Infants"])
-    
-    details["Number of Travelers"] = travelers
-    
-    # Extract transportation preferences
-    transport_modes = {
-        "flight": ["flight", "fly", "airplane", "airlines","airline" ,"aeroplane"],
-        "train": ["train", "railway"],
-        "bus": ["bus", "coach"],
-        "car": ["car", "auto", "automobile", "vehicle", "road trip", "drive"],
-        "boat": ["boat", "ship", "cruise", "ferry"],
-        "bike": ["bike", "bicycle", "cycling"],
-        "subway": ["subway", "metro", "underground"],
-        "tram": ["tram", "streetcar", "trolley"]
-    }
-    
-    transport_matches = []
-    for mode, keywords in transport_modes.items():
-        for keyword in keywords:
-            if re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
-                transport_matches.append(mode)
-                break
-    
-    details["Transportation Preferences"] = transport_matches if transport_matches else "Any"
-
-    # Extract budget details
-    # Budget classification keywords
-    budget_keywords = {
-    "friendly budget": "Mid-range Budget",
-    "mid-range budget": "Mid-range",
-    "luxury": "Luxury",
-    "cheap": "Low Budget",
-    "expensive": "Luxury",
-    "premium": "Luxury",
-    "high-range": "Luxury"
-    }
-
-    budget_matches = []
-    # Check for budget keywords in text
-    for key, val in budget_keywords.items():
-        if re.search(r'\b' + re.escape(key) + r'\b', text, re.IGNORECASE):
-            budget_matches.append(val)
-
-    # Currency name to symbol mapping (handling singular & plural)
-    currency_symbols = {
-    "USD": "$", "dollar": "$", "dollars": "$",
-    "EUR": "€", "euro": "€", "euros": "€",
-    "JPY": "¥", "yen": "¥",
-    "INR": "₹", "rupee": "₹", "rupees": "₹",
-    "GBP": "£", "pound": "£", "pounds": "£",
-    "CNY": "¥", "yuan": "¥", "RMB": "¥"
-    }
-
-    # First pattern: Budget with context words
-    budget_context_match = re.search(
-    r'\b(?:budget|cost|expense|spending cap|is|max limit|cost limit|amount|price)\s*(?:of\s*)?(?P<currency>\$|€|¥|₹|£)?\s*(?P<amount>[\d,]+)\s*(?P<currency_name>USD|dollars?|yen|JPY|euro|EUR|euros|rupees?|INR|pounds?|GBP|CNY|yuan|RMB)?\b',
-    text, re.IGNORECASE
-    )
-
-    # Second pattern: Direct currency amount without context words
-    direct_currency_match = re.search(
-    r'\b(?P<currency>\$|€|¥|₹|£)\s*(?P<amount>[\d,]+)\b|\b(?P<amount2>[\d,]+)\s*(?P<currency_name>USD|dollars?|yen|JPY|euro|EUR|euros|rupees?|INR|pounds?|GBP|CNY|yuan|RMB)\b',
-    text, re.IGNORECASE
-    )
-
-    # Process budget amount and currency
-    if budget_context_match:
-        currency_symbol = budget_context_match.group("currency") or ""
-        amount = budget_context_match.group("amount").replace(",", "")  # Normalize number format
-        currency_name = budget_context_match.group("currency_name") or ""
-        detected_symbol = currency_symbol or currency_symbols.get(currency_name.lower(), "")
-        
-        if not currency_symbol and not currency_name:
-            budget_value = f"{amount} (Specify currency)"
-        else:
-            budget_value = f"{detected_symbol}{amount}" + (f" ({currency_name})" if currency_name and not currency_symbol else "")
-    
-    # Use detected symbol or mapped currency name
-    elif direct_currency_match:
-        currency_symbol = direct_currency_match.group("currency") or ""
-        amount = direct_currency_match.group("amount") or direct_currency_match.group("amount2")
-        currency_name = direct_currency_match.group("currency_name") or ""
-        detected_symbol = currency_symbol or currency_symbols.get(currency_name.lower(), "")
-    # Use detected symbol or mapped currency name
-        if not currency_symbol and not currency_name:
-            budget_value = f"{amount} (Specify Currency)"
-        else:
-            budget_value = f"{detected_symbol}{amount}" + (f" ({currency_name})" if currency_name and not currency_symbol else "")
-
-    else:
-       budget_value = budget_matches[0] if budget_matches else "Unknown"
-
-    # Assign to details dictionary
-    details["Budget Range"] = budget_value
+    travelers_pattern = r'(?:(\d+)\s*(?:people|person|travelers?|pax|individuals?|adults?)|(?:family|group)\s*of\s*(\d+)|(?:me|I)\s*(?:and|with)\s*(\d+)\s*(?:others?|friends?|family)?)'
+    travelers_match = re.search(travelers_pattern, text, re.IGNORECASE)
+    if travelers_match:
+        # Get the first non-None group
+        num = travelers_match.group(1) or travelers_match.group(2) or travelers_match.group(3)
+        if num:
+            # If pattern is "me and X others", add 1 to X
+            if travelers_match.group(3):
+                details["Number of Travelers"] = str(int(num) + 1)
+            else:
+                details["Number of Travelers"] = num
+    elif any(word in text_lower for word in ["alone", "solo", "myself", "just me"]):
+        details["Number of Travelers"] = "1"
+    elif any(word in text_lower for word in ["couple", "two of us", "me and my"]):
+        details["Number of Travelers"] = "2"
     
     # Extract trip type
-    trip_type = {
-    "Adventure Travel": ["surfing","cycling","Scuba diving","hiking","trekking","camping", "skiing","ski", "backpacking", "extreme sports"],
-    "Ecotourism": ["wildlife watching", "nature walks", "eco-lodging"],
-    "Cultural Tourism": ["museum visits", "historical site tours", "local festivals"],
-    "Historical Tourism": ["castle tours", "archaeological site visits", "war memorial tours"],
-    "Luxury Travel": ["private island stays", "first-class flights", "fine dining experiences"],
-    "Wildlife Tourism": ["safari tours", "whale watching", "birdwatching"],
-    "Sustainable Tourism": ["eco-resorts", "community-based tourism", "carbon-neutral travel"],
-    "Volunteer Tourism": ["teaching abroad", "wildlife conservation", "disaster relief work"],
-    "Medical Tourism": ["cosmetic surgery", "dental care", "alternative medicine retreats"],
-    "Educational Tourism": ["study abroad programs", "language immersion", "historical research"],
-    "Business Travel": ["corporate meetings", "networking events", "industry trade shows"],
-    "Solo Travel": ["self-guided tours", "meditation retreats", "budget backpacking"],
-    "Group Travel": ["guided tours", "cruise trips", "family reunions"],
-    "Backpacking": ["hostel stays", "hitchhiking", "long-term travel"],
-    "Food Tourism": ["food tasting tours", "cooking classes", "street food exploration"],
-    "Religious Tourism": ["pilgrimages", "monastery visits", "religious festivals"],
-    "Digital Nomadism": ["co-working spaces", "long-term stays", "remote work-friendly cafes"],
-    "Family Travel": ["Family trip","theme parks","honeymoon", "kid-friendly resorts", "multi-generational travel","Family vacation"]
-    }
+    if any(word in text_lower for word in ["adventure", "trekking", "hiking", "rafting", "climbing"]):
+        details["Trip Type"] = "Adventure"
+    elif any(word in text_lower for word in ["beach", "resort", "spa", "relax", "leisure", "vacation"]):
+        details["Trip Type"] = "Leisure/Beach"
+    elif any(word in text_lower for word in ["business", "work", "conference", "meeting"]):
+        details["Trip Type"] = "Business"
+    elif any(word in text_lower for word in ["culture", "heritage", "museum", "historical", "sightseeing"]):
+        details["Trip Type"] = "Cultural/Sightseeing"
+    elif any(word in text_lower for word in ["family", "kids", "children"]):
+        details["Trip Type"] = "Family"
+    elif any(word in text_lower for word in ["honeymoon", "romantic", "couple"]):
+        details["Trip Type"] = "Romantic/Honeymoon"
     
-    trip_type_matches = []
-    for trip, keywords in trip_type.items():
-        for keyword in keywords:
-            if re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
-               trip_type_matches.append(trip)
-               break
+    # Extract transportation preferences
+    if any(word in text_lower for word in ["flight", "fly", "air", "plane"]):
+        details["Transportation Preferences"] = "Flight"
+    elif any(word in text_lower for word in ["train", "railway"]):
+        details["Transportation Preferences"] = "Train"
+    elif any(word in text_lower for word in ["car", "drive", "road trip"]):
+        details["Transportation Preferences"] = "Car/Road Trip"
+    elif any(word in text_lower for word in ["bus", "coach"]):
+        details["Transportation Preferences"] = "Bus"
     
-    details["Trip Type"] = trip_type_matches if trip_type_matches else "Leisure"
-       
     # Extract accommodation preferences
-    accommodation_types = {
-    "Boutique hotels": ["hotel", "boutique hotel", "small hotel", "intimate hotel"],
-    "Resorts": ["resort", "holiday resort", "self-contained resort", "luxury resort"],
-    "Hostels": ["hostel","hostels", "dormitory", "shared accommodation"],
-    "Bed and breakfasts": ["bed and breakfast", "B&B", "guesthouse"],
-    "Motels": ["motel", "motor lodge", "roadside motel"],
-    "Guesthouses": ["guesthouse", "private guesthouse", "pension"],
-    "Vacation rentals": ["vacation rental", "holiday rental", "short-term rental", "airbnb"],
-    "Camping": ["camping", "campground", "tent", "camp"]
-    }
+    if any(word in text_lower for word in ["luxury", "5 star", "premium", "high-end"]):
+        details["Accommodation Preferences"] = "Luxury"
+    elif any(word in text_lower for word in ["budget", "cheap", "affordable", "hostel"]):
+        details["Accommodation Preferences"] = "Budget"
+    elif any(word in text_lower for word in ["mid-range", "3 star", "moderate"]):
+        details["Accommodation Preferences"] = "Mid-range"
+    elif any(word in text_lower for word in ["resort", "all-inclusive"]):
+        details["Accommodation Preferences"] = "Resort"
+    elif any(word in text_lower for word in ["homestay", "local", "authentic"]):
+        details["Accommodation Preferences"] = "Homestay/Local"
     
-    accommodation_matches = []
-    for accomm_type, keywords in accommodation_types.items():
-        for keyword in keywords:
-            if re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
-                accommodation_matches.append(accomm_type)
-                break
-    
-    details["Accommodation Preferences"] = accommodation_matches if accommodation_matches else "Not specified"
-    
-    # Extract special preferences    
-    special_requirements = ["wheelchair access", "vegetarian meals", "vegan", "gluten-free"]
-    found_requirements = [req for req in special_requirements if req in text.lower()]
-    details["Special Requirements"] = ", ".join(found_requirements) if found_requirements else "Not specified"
+    # Extract special requirements
+    special_requirements = []
+    if any(word in text_lower for word in ["vegetarian", "vegan", "no meat"]):
+        special_requirements.append("Vegetarian/Vegan food")
+    if any(word in text_lower for word in ["disability", "wheelchair", "accessible"]):
+        special_requirements.append("Accessibility requirements")
+    if any(word in text_lower for word in ["pets", "dog", "cat"]):
+        special_requirements.append("Pet-friendly")
+    if any(word in text_lower for word in ["medical", "medicine", "treatment"]):
+        special_requirements.append("Medical considerations")
+    if special_requirements:
+        details["Special Requirements"] = ", ".join(special_requirements)
     
     return details
 
-# Function to generate itinerary using Gemini
-def generate_itinerary_with_gemini(prompt):
-    model = setup_gemini()
+def generate_itinerary(details, user_input):
     try:
+        # Setup Gemini
+        model = setup_gemini()
+        
+        # Create a comprehensive prompt for the AI
+        prompt = f"""
+        Create a detailed travel itinerary based on the following information:
+        
+        **Travel Details:**
+        - Destination: {details.get('Destination', 'Not specified')}
+        - Starting Location: {details.get('Starting Location', 'Not specified')}
+        - Duration: {details.get('Trip Duration', 'Not specified')}
+        - Start Date: {details.get('Start Date', 'Not specified')}
+        - End Date: {details.get('End Date', 'Not specified')}
+        - Number of Travelers: {details.get('Number of Travelers', 'Not specified')}
+        - Budget: {details.get('Budget Range', 'Not specified')}
+        - Trip Type: {details.get('Trip Type', 'Not specified')}
+        - Transportation: {details.get('Transportation Preferences', 'Not specified')}
+        - Accommodation: {details.get('Accommodation Preferences', 'Not specified')}
+        - Special Requirements: {details.get('Special Requirements', 'Not specified')}
+        
+        **Original Request:** {user_input}
+        
+        Please create a comprehensive travel itinerary that includes:
+        
+        ## 1. Trip Overview
+        - Brief summary of the trip
+        - Key highlights and themes
+        
+        ## 2. Daily Itinerary
+        For each day, provide:
+        - **Day X: [Location/Theme]**
+        - **Morning:** Detailed morning activities with times
+        - **Afternoon:** Detailed afternoon activities with times  
+        - **Evening:** Detailed evening activities with times
+        - **Meals:**
+          - Breakfast: Specific restaurant/location recommendations
+          - Lunch: Specific restaurant/location recommendations  
+          - Dinner: Specific restaurant/location recommendations
+        - **Accommodation:** Specific hotel/accommodation recommendations with brief description
+        
+        ## 3. Accommodation Details
+        - Specific hotel recommendations with:
+          - Hotel names and locations
+          - Price ranges per night
+          - Key amenities and features
+          - Why each hotel fits the traveler's needs
+        
+        ## 4. Dining Recommendations  
+        - Must-try restaurants and local cuisines
+        - Food experiences and specialties
+        - Price ranges and dining styles
+        
+        ## 5. Attractions & Activities
+        - Top attractions with descriptions
+        - Unique experiences and activities
+        - Entry fees and timings where applicable
+        
+        ## 6. Budget Breakdown
+        - Accommodation costs
+        - Transportation costs
+        - Food and dining costs
+        - Activities and attractions costs
+        - Shopping and miscellaneous costs
+        - Total estimated cost
+        
+        ## 7. Essential Information
+        - Transportation details (flights, local transport)
+        - Weather considerations and packing suggestions
+        - Local customs and etiquette
+        - Emergency contacts and important numbers
+        - Currency and payment methods
+        - Language tips and useful phrases
+        
+        Please make the itinerary detailed, practical, and tailored to the specific requirements mentioned. Include specific names, locations, and realistic time estimates.
+        """
+        
+        # Generate the itinerary
         response = model.generate_content(prompt)
         return response.text
+        
     except Exception as e:
         st.error(f"Error generating itinerary: {str(e)}")
-        import traceback
-        error_details = traceback.format_exc()
-        st.error(f"Error details: {error_details}")
-        return f"Error generating itinerary: {str(e)}"
+        return None
 
-# Prompt Generation Agent
-def generate_prompt(details):
-    #destination_place
-    destination = details.get("Destination", "").strip()    
-    if not destination:
-        return "Error❗Error❗Error❗ Please specify a Destination place."
+def parse_itinerary_data(itinerary_text):
+    """Parse the AI-generated itinerary into structured data for different tabs"""
     
-    #start_dates
-    start_date_str = details.get("Start Date", "").strip()
-    if not start_date_str:
-           return "Error❗Error❗Error❗ Please specify a Start Date."
+    parsed_data = {
+        "overview": "",
+        "days": [],
+        "accommodation": "",
+        "dining": "",
+        "attractions": "",
+        "budget": "",
+        "essential_info": "",
+        "transportation": ""
+    }
+    
+    if not itinerary_text:
+        return parsed_data
+    
+    # Extract overview section
+    overview_match = re.search(r'##\s*1\.\s*Trip Overview(.*?)(?=##\s*2\.|$)', itinerary_text, re.DOTALL | re.IGNORECASE)
+    if overview_match:
+        parsed_data["overview"] = overview_match.group(1).strip()
+    
+    # Extract accommodation section
+    accommodation_match = re.search(r'##\s*3\.\s*Accommodation Details(.*?)(?=##\s*4\.|$)', itinerary_text, re.DOTALL | re.IGNORECASE)
+    if accommodation_match:
+        parsed_data["accommodation"] = accommodation_match.group(1).strip()
+    
+    # Extract dining section
+    dining_match = re.search(r'##\s*4\.\s*Dining Recommendations(.*?)(?=##\s*5\.|$)', itinerary_text, re.DOTALL | re.IGNORECASE)
+    if dining_match:
+        parsed_data["dining"] = dining_match.group(1).strip()
+    
+    # Extract attractions section
+    attractions_match = re.search(r'##\s*5\.\s*Attractions & Activities(.*?)(?=##\s*6\.|$)', itinerary_text, re.DOTALL | re.IGNORECASE)
+    if attractions_match:
+        parsed_data["attractions"] = attractions_match.group(1).strip()
+    
+    # Extract budget section
+    budget_match = re.search(r'##\s*6\.\s*Budget Breakdown(.*?)(?=##\s*7\.|$)', itinerary_text, re.DOTALL | re.IGNORECASE)
+    if budget_match:
+        parsed_data["budget"] = budget_match.group(1).strip()
+    
+    # Extract essential info section
+    essential_match = re.search(r'##\s*7\.\s*Essential Information(.*?)$', itinerary_text, re.DOTALL | re.IGNORECASE)
+    if essential_match:
+        parsed_data["essential_info"] = essential_match.group(1).strip()
+    
+    # Extract daily itinerary section
+    daily_section_match = re.search(r'##\s*2\.\s*Daily Itinerary(.*?)(?=##\s*3\.|$)', itinerary_text, re.DOTALL | re.IGNORECASE)
+    if daily_section_match:
+        daily_content = daily_section_match.group(1).strip()
         
-    valid_formats = ["%Y-%m-%d", "%d-%m-%Y"]
-    
-    start_date = None
-    for fmt in valid_formats:
-        try:
-               start_date = datetime.strptime(start_date_str, fmt).date()
-               break  # Exit loop if parsing succeeds
-        except ValueError:
-            continue  # Try next format
-    
-    if start_date is None:  # If no valid format matched
-        return "Error❗Error❗Error❗ Invalid Start Date. Please enter a valid date."
-
-    today = datetime.today().date()
-    if start_date < today:
-        return "Error❗Error❗Error❗ Start Date should not be in the past."
-    
-            
-    # Trip Duration (including negative ones)
-    prompt = f"Generate a detailed itinerary for a {details.get('Trip Type', 'general')} trip to {details.get('Destination', 'an unknown destination')} for {details['Number of Travelers'].get('Adults', '1')} adult"
-    trip_duration = details.get("Trip Duration", "").strip()
-    match = re.search(r"-?\d+", trip_duration)  
-    if match:
-        duration_value = int(match.group())
-        if duration_value <= 0:
-            return "Error❗Error❗Error❗ Enter the correct dates."
-        
-    #Budget_range   
-    budget_range = details.get("Budget Range", "").strip()
-    match = re.search(r"\d+", budget_range)
-    if not match:
-        return "Error❗Error❗Error❗ Please specify your budget as a range (e.g., 1000-2000)." 
-    #number_of_travelers
-    number_of_travelers = details.get("Number of Travelers", "")
-    adults = number_of_travelers.get("Adults", 0)
-    children = number_of_travelers.get("Children", 0) 
-    if adults == 0 and children == 0:
-        return "Error❗Error❗Error❗ At least one adult or a child should be there for the trip."
-    
-    # Pluralize 'adults' correctly
-    if details['Number of Travelers'].get('Adults', '1') != "1":
-        prompt += "s"
-    
-    # Add children & infants if applicable
-    if details['Number of Travelers'].get('Children', "0") != "0":
-        prompt += f" and {details['Number of Travelers']['Children']} children"
-    
-    if details['Number of Travelers'].get('Infants', "0") != "0":
-        prompt += f" and {details['Number of Travelers']['Infants']} infants"
-    
-    # Starting location and start date (only if both exist)
-    if "Starting Location" in details and "Start Date" in details:
-        prompt += f", starting from {details['Starting Location']} and departing on {details['Start Date']}"
-    elif "Starting Location" in details:
-        prompt += f", starting from {details['Starting Location']}"
-    elif "Start Date" in details:
-        prompt += f", departing on {details['Start Date']}"
-    
-    # End date
-    if details.get("End Date"):
-        prompt += f". The trip ends on {details['End Date']}."
-    
-    # Budget and general recommendations
-    prompt += f" Please consider a {details.get('Budget Range', 'moderate')} budget and provide accommodation, dining, and activity recommendations."
-    
-    # Transportation preferences
-    if details.get("Transportation Preferences") and details["Transportation Preferences"] != "Any":
-        prompt += f" Suggested transportation methods include: {', '.join(details['Transportation Preferences'])}."
-    
-    # Accommodation preferences
-    if details.get("Accommodation Preferences") and details["Accommodation Preferences"] != "Any":
-        prompt += f" Preferred accommodation: {details['Accommodation Preferences']}."
-    
-    # Special requirements
-    if details.get("Special Requirements") and details["Special Requirements"] not in ["None", "", None]:
-        prompt += f" Special requirements: {details['Special Requirements']}."
-    
-    # Add top attractions
-    prompt += f" Include a section on the top 5-7 must-visit attractions in {destination} with brief descriptions and why they're worth visiting."
-    
-    # Add travel tips
-    prompt += f" Provide a section with practical travel tips specific to {destination}, including local customs, transportation advice, safety information, and any seasonal considerations."
-    
-    # Add weather forecast
-    if "Start Date" in details and details.get("Trip Duration"):
-        prompt += f" Include a general weather forecast for {destination} during the trip duration (from {details['Start Date']}"
-        if details.get("End Date"):
-            prompt += f" to {details['End Date']}"
-        prompt += "), including expected temperatures, precipitation, and appropriate clothing recommendations."
-    # NEW: Add request for affordable dining options near hotels and attractions
-    prompt += f" For each day, suggest 2-3 affordable dining options that are within walking distance or a short trip from the recommended accommodations and attractions for that day. Include the price range, cuisine type, and any specialties or popular dishes."
-    # Daily itinerary request
-    prompt += f"\n1. Daily Itinerary: Provide a detailed day-by-day plan for the entire {duration_value} day trip, including:"
-    prompt += "\n   - Activities and attractions for each day with approximate time allocations"
-    prompt += "\n   - Recommended accommodations for each night"
-    prompt += "\n   - Suggested meals and dining options (breakfast, lunch, dinner) with price estimates in local currency and USD"
-    prompt += "\n   - Transportation options between locations with costs"
-    
-# Top attractions request
-    prompt += f"\n2. Top Attractions: List 9 must-visit attractions in {destination} with:"
-    prompt += "\n   - Brief descriptions of each attraction"
-    prompt += "\n   - Why they're worth visiting"
-    prompt += "\n   - Entrance fees and costs"
-    prompt += "\n   - Transportation options to reach them from city center with costs"
-
-# Accommodation options - REVISED
-    prompt += "\n3. Accommodation Options: Provide 7 detailed accommodation recommendations with:"
-    prompt += "\n   - Specific price range per night in local currency and USD"
-    prompt += "\n   - Precise neighborhood and location description"
-    prompt += "\n   - Complete list of amenities and unique benefits"
-    prompt += "\n   - Full address and proximity to main attractions"
-    prompt += "\n   - Do NOT refer to the daily itinerary - include all details here"
-
-# Dining recommendations - REVISED
-    prompt += "\n4. Dining Recommendations:"
-    prompt += "\n   - Include at least 10 restaurant options organized by neighborhood/area"
-    prompt += "\n   - Specify price range per meal in local currency and USD for each restaurant"
-    prompt += "\n   - Detail signature dishes and cuisine specialties for each recommendation"
-    prompt += "\n   - Provide exact restaurant locations and address"
-    prompt += "\n   - Do NOT refer to the daily itinerary - include all details here"
-
-# Transportation information
-    prompt += "\n5. Transportation Information:"
-    prompt += "\n   - Options for getting around (public transport, taxis, rentals)"
-    prompt += "\n   - Costs for each transportation method"
-    prompt += "\n   - Tips for navigating local transportation"
-
-# Travel tips
-    prompt += f"\n6. Travel Tips for {destination}:"
-    prompt += "\n   - Local customs and etiquette"
-    prompt += "\n   - Safety information"
-    prompt += "\n   - Local language and culture"
-    prompt += "\n   - Currency and payment advice"
-    prompt += "\n   - Seasonal considerations"
-
-# Weather forecast
-    prompt += f"\n7. Weather Forecast:"
-    prompt += f"\n   - Expected temperatures and conditions in {destination} during the trip dates"
-    prompt += "\n   - Clothing recommendations based on the weather"
-
-# 8. Budget Breakdown
-    prompt += "\n\n8. Budget Breakdown:"
-    prompt += "\n   - Estimated total cost for the entire trip"
-    prompt += "\n   - Breakdown by category (accommodation, food, transportation, activities)"
-    prompt += "\n   - Money-saving tips specific to the destination"
-
-# 9. Emergency Information
-    prompt += "\n\n9. Emergency Information:"
-    prompt += "\n   - Local emergency numbers"
-    prompt += "\n   - Nearest hospitals or medical facilities"
-    prompt += "\n   - Embassy or consulate information if international"
-    return prompt
-
-
-# New function to extract structured JSON from itinerary
-def extract_itinerary_json(itinerary_text):
-    try:
-        # First try to find a JSON block that might be included in the response
-        import re
-        import json
-        import traceback
-        
-        json_pattern = r'```json\s*([\s\S]*?)\s*```'
-        json_match = re.search(json_pattern, itinerary_text)
-        
-        if json_match:
-            json_str = json_match.group(1)
-            try:
-                return json.loads(json_str)
-            except:
-                pass  # If parsing fails, continue to the more complex extraction
-        
-        # If no JSON block or parsing failed, use more advanced parsing
-        parsed_data = {
-            "trip_overview": {},
-            "days": [],
-            "attractions": [],
-            "accommodations": [],
-            "dining": [],
-            "transportation": [],
-            "travel_tips": [],
-            "weather": {}
-        }
-        
-        # Extract trip overview
-        destination_match = re.search(r'(?:itinerary for|trip to)\s+([^\n,\.]+)', itinerary_text, re.IGNORECASE)
-        if destination_match:
-            parsed_data["trip_overview"]["destination"] = destination_match.group(1).strip()
-        
-        duration_match = re.search(r'(\d+)(?:-|\s+to\s+)day', itinerary_text, re.IGNORECASE)
-        if duration_match:
-            parsed_data["trip_overview"]["duration_days"] = int(duration_match.group(1))
-        
-        # Try to extract trip type and budget
-        trip_type_match = re.search(r'(?:type of trip|trip type):\s*([^\n\.]+)', itinerary_text, re.IGNORECASE)
-        if trip_type_match:
-            parsed_data["trip_overview"]["trip_type"] = trip_type_match.group(1).strip()
-            
-        budget_match = re.search(r'(?:budget|cost|price)(?:\s+range)?:\s*([^\n\.]+)', itinerary_text, re.IGNORECASE)
-        if budget_match:
-            parsed_data["trip_overview"]["budget_range"] = budget_match.group(1).strip()
-        
-        # Extract days (looking for day patterns like "Day 1", "Day 2: Title")
-        day_pattern = r'Day\s+(\d+)(?:[\s\-:]+([^\n]+))?'
-        day_matches = list(re.finditer(day_pattern, itinerary_text))
+        # Find all day entries
+        day_matches = list(re.finditer(r'\*\*Day (\d+):[^*]*\*\*', daily_content, re.IGNORECASE))
         
         for i, match in enumerate(day_matches):
             day_num = int(match.group(1))
-            day_title = match.group(2).strip() if match.group(2) else ""
+            day_title = match.group(0).strip()
             
             # Get the content of this day (until next day or end)
             start_pos = match.end()
-            end_pos = day_matches[i+1].start() if i < len(day_matches) - 1 else len(itinerary_text)
-            day_content = itinerary_text[start_pos:end_pos].strip()
+            end_pos = day_matches[i+1].start() if i < len(day_matches) - 1 else len(daily_content)
+            day_content = daily_content[start_pos:end_pos].strip()
             
             # Initialize day data structure
             day_data = {
@@ -1075,1102 +967,498 @@ def extract_itinerary_json(itinerary_text):
                 if dinner_match:
                     day_data["meals"]["dinner"] = dinner_match.group(1).strip()
             
-            # Extract accommodation with price details
-            accommodation_section = re.search(r'(?:\*|\-)\s+\*\*Accommodation:\*\*\s+([\s\S]*?)(?=(?:\*|\-)|$)', day_content, re.IGNORECASE)
-            if accommodation_section:
-                accommodation_text = accommodation_section.group(1).strip()
-                day_data["accommodation"] = accommodation_text
-                
-                # Extract accommodation details and add to accommodations list
-                accommodation_items = re.findall(r'([\w\s]+)\s+\(([^\)]+)\)', accommodation_text)
-                for item in accommodation_items:
-                    accommodation_name = item[0].strip()
-                    price_range = item[1].strip()
-                    
-                    # Check if this accommodation is already in the list
-                    existing_acc = next((acc for acc in parsed_data["accommodations"] if acc["name"] == accommodation_name), None)
-                    if not existing_acc:
-                        parsed_data["accommodations"].append({
-                            "name": accommodation_name,
-                            "description": "",
-                            "price_range": price_range
-                        })
+            # Extract accommodation - enhanced to capture more details
+            accommodation_match = re.search(r'(?:\*|\-)\s+\*\*Accommodation:\*\*\s+([\s\S]*?)(?=(?:\*|\-)\s+\*\*|$)', day_content, re.IGNORECASE)
+            if accommodation_match:
+                day_data["accommodation"] = accommodation_match.group(1).strip()
             else:
-                # Fallback to original approach
-                accommodation_match = re.search(r'(?:Accommodation|Stay|Hotel|Lodge)(?:[\s\-:]+)([^#\n]+)', day_content, re.IGNORECASE)
+                # Fallback approach
+                accommodation_match = re.search(r'(?:Accommodation|Stay|Hotel)(?:[\s\-:]+)([^#\n]+)', day_content, re.IGNORECASE)
                 if accommodation_match:
                     day_data["accommodation"] = accommodation_match.group(1).strip()
-                    
-                    # Also add to accommodations list if not already there
-                    accommodation_name = accommodation_match.group(1).strip()
-                    if not any(acc.get("name") == accommodation_name for acc in parsed_data["accommodations"]):
-                        parsed_data["accommodations"].append({
-                            "name": accommodation_name,
-                            "description": "",
-                            "price_range": ""
-                        })
             
-            # Extract dining details from meals
-            extract_dining_from_meals(day_data, parsed_data)
-            
-            # Extract activities
-            # First try bullet points with activity names
-            activity_pattern = r'(?:^|\n)\s*(?:[\*\-•]|\d+\.)\s+([^\n]+)'
-            activities = re.finditer(activity_pattern, day_content, re.MULTILINE)
-            for act_match in activities:
-                activity = act_match.group(1).strip()
-                # Skip section headers that were matched
-                if not activity.startswith("**") and ":**" not in activity:
-                    day_data["activities"].append(activity)
-            
-            # If no activities were found via bullets, extract from the time-based sections
-            if not day_data["activities"] and (day_data["morning"] or day_data["afternoon"] or day_data["evening"]):
-                # Extract activities from time-based sections
-                all_activities = []
-                for section in [day_data["morning"], day_data["afternoon"], day_data["evening"]]:
-                    if section:
-                        # Split by semicolons, periods, or commas for potential activities
-                        section_activities = re.split(r'(?<=[.;])\s+|\s*,\s*', section)
-                        all_activities.extend([act.strip() for act in section_activities if act.strip()])
+            # Extract activities list
+            activities_matches = re.findall(r'(?:Visit|Explore|Experience|Activity)(?:[\s\-:]+)([^#\n]+)', day_content, re.IGNORECASE)
+            if activities_matches:
+                day_data["activities"] = [activity.strip() for activity in activities_matches]
+            else:
+                # Try to extract from bullet points or numbered lists
+                bullet_activities = re.findall(r'(?:^|\n)(?:\d+\.|\*|\-)\s*([^*#\n]+)', day_content, re.MULTILINE)
+                if bullet_activities:
+                    # Filter out section headers and keep actual activities
+                    all_activities = []
+                    for activity in bullet_activities:
+                        activity = activity.strip()
+                        # Skip if it looks like a section header
+                        if not re.match(r'\*\*(Morning|Afternoon|Evening|Meals|Accommodation):', activity):
+                            # Split by common separators and clean
+                            section_activities = re.split(r'[,;]', activity)
+                            all_activities.extend([act.strip() for act in section_activities if act.strip()])
                 
                 day_data["activities"] = all_activities
+            
+            # Enhanced fallback: Extract any structured content from day text
+            if not day_data["morning"] and not day_data["afternoon"] and not day_data["evening"]:
+                # Try to extract from bullet points or numbered lists
+                content_lines = [line.strip() for line in day_content.split('\n') if line.strip()]
+                activities = []
+                
+                for line in content_lines:
+                    # Skip headers and formatting
+                    if re.match(r'^\*+|^#+|^Day \d+|^\-+$', line):
+                        continue
+                    # Look for bullet points or activities
+                    if re.match(r'^[\*\-•]\s*', line) or re.match(r'^\d+\.', line):
+                        activity = re.sub(r'^[\*\-•]\s*|\d+\.\s*', '', line).strip()
+                        if activity and len(activity) > 10:
+                            activities.append(activity)
+                    elif len(line) > 15 and not line.startswith('**'):
+                        activities.append(line)
+                
+                # Distribute activities across time periods
+                if activities:
+                    if len(activities) >= 1:
+                        day_data["morning"] = activities[0]
+                    if len(activities) >= 2:
+                        day_data["afternoon"] = activities[1]
+                    if len(activities) >= 3:
+                        day_data["evening"] = activities[2]
+                    else:
+                        # If only 1-2 activities, use generic content
+                        if not day_data["afternoon"]:
+                            day_data["afternoon"] = "Continue exploring local attractions"
+                        if not day_data["evening"]:
+                            day_data["evening"] = "Evening leisure time"
+            
+            # Enhanced meal extraction if still empty  
+            if not day_data["meals"]["breakfast"] and not day_data["meals"]["lunch"] and not day_data["meals"]["dinner"]:
+                # Try to find meal references in the day content
+                for meal_type in ["breakfast", "lunch", "dinner"]:
+                    # Look for various meal patterns
+                    meal_patterns = [
+                        rf'{meal_type}[:\-]\s*([^\n,;]+)',
+                        rf'\b{meal_type}\s+at\s+([^\n,;]+)',
+                        rf'for\s+{meal_type}[:\-]?\s*([^\n,;]+)',
+                        rf'{meal_type.capitalize()}[:\-]\s*([^\n,;]+)'
+                    ]
+                    
+                    for pattern in meal_patterns:
+                        meal_match = re.search(pattern, day_content, re.IGNORECASE)
+                        if meal_match:
+                            meal_info = meal_match.group(1).strip()
+                            if len(meal_info) > 5:  # Only use if substantial
+                                day_data["meals"][meal_type] = meal_info
+                                break
+                
+                # If still no meals found, add realistic defaults
+                if not day_data["meals"]["breakfast"]:
+                    day_data["meals"]["breakfast"] = "Local breakfast restaurant or hotel dining"
+                if not day_data["meals"]["lunch"]:
+                    day_data["meals"]["lunch"] = "Traditional local cuisine for lunch"
+                if not day_data["meals"]["dinner"]:
+                    day_data["meals"]["dinner"] = "Local restaurant with regional specialties"
+            
+            # Enhanced accommodation extraction if still empty
+            if not day_data["accommodation"]:
+                # Try to find accommodation references in the day content
+                accommodation_patterns = [
+                    r'(?:accommodation|hotel|stay|lodge|resort)[:\-]\s*([^\n,;]+)',
+                    r'stay\s+at\s+([^\n,;]+)',
+                    r'overnight\s+at\s+([^\n,;]+)',
+                    r'accommodation[:\-]?\s*([^\n,;]+)'
+                ]
+                
+                for pattern in accommodation_patterns:
+                    acc_match = re.search(pattern, day_content, re.IGNORECASE)
+                    if acc_match:
+                        acc_info = acc_match.group(1).strip()
+                        if len(acc_info) > 5:  # Only use if substantial
+                            day_data["accommodation"] = acc_info
+                            break
+                
+                # If still no accommodation found, add a realistic default
+                if not day_data["accommodation"]:
+                    day_data["accommodation"] = "Mid-range hotel or guesthouse in city center"
             
             parsed_data["days"].append(day_data)
         
         # Extract transportation details
         extract_transportation(itinerary_text, parsed_data)
-        
-        # Extract attractions
-        extract_attractions(itinerary_text, parsed_data)
-        
-        # Extract travel tips
-        extract_travel_tips(itinerary_text, parsed_data)
-        
-        # Extract weather information
-        extract_weather_info(itinerary_text, parsed_data)
-        
-        # Return the structured data
-        return parsed_data
-        
-    except Exception as e:
-        # If parsing fails, return a basic structure with error information
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            "message": "Failed to parse itinerary into structured JSON. Manual processing required.",
-            "raw_text": itinerary_text
-        }
-
-# Helper function to extract meal details from text
-def extract_meal_details(meal_text):
-    # Create a basic structure
-    meal_info = {
-        "name": "",
-        "description": "",
-        "price_range": ""
-    }
     
-    # Extract restaurant name with price if available
-    if "at" in meal_text.lower():
-        restaurant_match = re.search(r'at\s+([^(]+)(?:\s*\(([^)]+)\))?', meal_text, re.IGNORECASE)
-        if restaurant_match:
-            meal_info["name"] = restaurant_match.group(1).strip()
-            if restaurant_match.group(2):
-                meal_info["price_range"] = restaurant_match.group(2).strip()
-    elif ":" in meal_text:
-        parts = meal_text.split(":", 1)
-        meal_info["name"] = parts[0].strip()
-        meal_info["description"] = parts[1].strip()
-    else:
-        meal_info["name"] = meal_text.strip()
-    
-    # Extract price range if available
-    price_match = re.search(r'(?:[$€£₹]\d+(?:-|\s*to\s*)[$€£₹]?\d+|\w+\s+price(?:\s+range)?)', meal_text, re.IGNORECASE)
-    if price_match and not meal_info["price_range"]:
-        meal_info["price_range"] = price_match.group(0).strip()
-    
-    return meal_info
+    return parsed_data
 
-# Helper function to extract dining info from meals sections
-def extract_dining_from_meals(day_data, parsed_data):
-    # Extract detailed meals info and add to dining list
-    for meal_type in ["breakfast", "lunch", "dinner"]:
-        meal_text = day_data["meals"].get(meal_type, "")
-        if meal_text and "N/A" not in meal_text:
-            meal_info = extract_meal_details(meal_text)
-            if meal_info and meal_info["name"]:
-                # Check if this dining option is already in the list
-                if not any(d.get("name") == meal_info["name"] for d in parsed_data["dining"]):
-                    meal_info["meal_type"] = meal_type.capitalize()
-                    parsed_data["dining"].append(meal_info)
-
-# Helper function to extract transportation details
 def extract_transportation(itinerary_text, parsed_data):
-    # Extract from dedicated transportation section
-    transport_section = re.search(r'(?:Transportation|Getting Around|Transport)[\s\S]*?(?=\n#|\Z)', itinerary_text, re.IGNORECASE)
-    if transport_section:
-        transport_text = transport_section.group(0)
-        
-        # Extract specific transportation details with prices
-        transport_pattern = r'(?:[\*\-•]|\d+\.)\s+([^:]+)(?::\s+|\n\s*)([\s\S]*?)(?=(?:[\*\-•]|\d+\.)\s+|\n#|\Z)'
-        transport_items = re.finditer(transport_pattern, transport_text)
-        
-        for match in transport_items:
-            transport_type = match.group(1).strip()
-            details = match.group(2).strip() if match.group(2) else ""
-            
-            parsed_data["transportation"].append({
-                "type": transport_type,
-                "details": details
-            })
+    """Extract transportation information from the itinerary"""
     
-    # Also scan all day content for transportation mentions
-    transport_keywords = ["taxi", "bus", "train", "subway", "metro", "car", "rental", "bike", "walk", "ferry", "boat", "transfer"]
-    for day in parsed_data["days"]:
-        day_content = day.get("morning", "") + " " + day.get("afternoon", "") + " " + day.get("evening", "")
+    transportation_info = []
+    
+    # Look for flight information
+    flight_matches = re.findall(r'(?:flight|airline|plane|air travel)[\s\-:]*([^\n.]+)', itinerary_text, re.IGNORECASE)
+    for match in flight_matches:
+        if len(match.strip()) > 10:
+            transportation_info.append(f"✈️ Flight: {match.strip()}")
+    
+    # Look for train information
+    train_matches = re.findall(r'(?:train|railway|rail)[\s\-:]*([^\n.]+)', itinerary_text, re.IGNORECASE)
+    for match in train_matches:
+        if len(match.strip()) > 10:
+            transportation_info.append(f"🚂 Train: {match.strip()}")
+    
+    # Look for local transport
+    local_transport_matches = re.findall(r'(?:taxi|bus|metro|local transport|public transport)[\s\-:]*([^\n.]+)', itinerary_text, re.IGNORECASE)
+    for match in local_transport_matches:
+        if len(match.strip()) > 10:
+            transportation_info.append(f"🚌 Local Transport: {match.strip()}")
+    
+    if transportation_info:
+        parsed_data["transportation"] = "\n".join(transportation_info)
+    else:
+        parsed_data["transportation"] = "Transportation details will vary based on your preferences and final bookings."
+
+def display_day_details(day_data):
+    """Display detailed information for a specific day"""
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Morning activities
+        st.subheader("🌅 Morning")
+        if day_data["morning"]:
+            st.write(day_data["morning"])
+        else:
+            st.info("Morning activities not specified")
         
-        for keyword in transport_keywords:
-            # Find transportation mentions with potential price info
-            transport_pattern = r'(?:' + keyword + r')[^.]*?(?:[\$₹€£]\d+[^.]*?)?'
-            transport_matches = re.finditer(transport_pattern, day_content, re.IGNORECASE)
-            
-            for transport_match in transport_matches:
-                transport_text = transport_match.group(0).strip()
+        # Afternoon activities
+        st.subheader("☀️ Afternoon") 
+        if day_data["afternoon"]:
+            st.write(day_data["afternoon"])
+        else:
+            st.info("Afternoon activities not specified")
+        
+        # Evening activities
+        st.subheader("🌙 Evening")
+        if day_data["evening"]:
+            st.write(day_data["evening"])
+        else:
+            st.info("Evening activities not specified")
+    
+    with col2:
+        # Meals
+        st.subheader("🍽️ Meals")
+        
+        # Breakfast
+        if day_data["meals"]["breakfast"]:
+            st.write(f"**Breakfast:** {day_data['meals']['breakfast']}")
+        
+        # Lunch
+        if day_data["meals"]["lunch"]:
+            st.write(f"**Lunch:** {day_data['meals']['lunch']}")
+        
+        # Dinner
+        if day_data["meals"]["dinner"]:
+            st.write(f"**Dinner:** {day_data['meals']['dinner']}")
+        
+        # Accommodation
+        st.subheader("🏨 Accommodation")
+        if day_data["accommodation"]:
+            st.write(day_data["accommodation"])
+        else:
+            st.info("Accommodation details not specified")
+        
+        # Activities
+        if day_data["activities"]:
+            st.subheader("🎯 Key Activities")
+            for activity in day_data["activities"]:
+                st.write(f"• {activity}")
+
+def create_trip_examples():
+    """Create example trip requests for users"""
+    
+    examples = {
+        "Beach Vacation": {
+            "text": "Plan a 7-day beach vacation to Goa for 2 people in December with a budget of ₹50,000. We want to relax, enjoy water sports, and experience local cuisine.",
+            "icon": "🏖️"
+        },
+        "Adventure Trip": {
+            "text": "I want to go on a 10-day adventure trip to Nepal for trekking in the Himalayas. Budget is $2000, traveling solo in March.",
+            "icon": "🏔️"
+        },
+        "Cultural Tour": {
+            "text": "Plan a cultural tour of Rajasthan for 2 weeks in January. Family of 4, interested in heritage sites, local crafts, and traditional food. Budget ₹1.5 lakh.",
+            "icon": "🏛️"
+        },
+        "International Trip": {
+            "text": "From Mumbai to Thailand for 8 days in February. Couple trip, mid-range hotels, interested in temples, street food, and shopping. Budget ₹80,000.",
+            "icon": "🌍"
+        },
+        "Weekend Getaway": {
+            "text": "Quick weekend trip from Delhi to Shimla for 3 days in April. Budget ₹15,000 for 2 people, prefer hill stations and pleasant weather.",
+            "icon": "🚗"
+        }
+    }
+    
+    return examples
+
+# Main application
+def main():
+    # Header
+    st.title("🌍 Travel Planner Pro")
+    st.markdown("### Plan your perfect trip with AI-powered recommendations")
+    
+    # Sidebar
+    with st.sidebar:
+        st.header("✈️ Quick Trip Examples")
+        st.markdown("Click on any example to get started:")
+        
+        examples = create_trip_examples()
+        
+        for title, example in examples.items():
+            if st.button(f"{example['icon']} {title}", key=f"example_{title}", use_container_width=True):
+                st.session_state.example_text = example['text']
+        
+        st.markdown("---")
+        st.markdown("### 💡 Tips for Better Results")
+        st.markdown("""
+        - Mention specific dates or months
+        - Include your budget range
+        - Specify number of travelers
+        - Mention preferences (adventure, relaxation, culture)
+        - Include starting city for better recommendations
+        """)
+        
+        st.markdown("---")
+        st.markdown("### 🎯 What You'll Get")
+        st.markdown("""
+        - **Detailed daily itinerary**
+        - **Hotel recommendations**
+        - **Restaurant suggestions**
+        - **Local attractions**
+        - **Budget breakdown**
+        - **Travel tips**
+        """)
+    
+    # Main content area
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        # Text input area
+        default_text = st.session_state.get('example_text', '')
+        user_input = st.text_area(
+            "📝 Describe your dream trip:",
+            placeholder="Example: Plan a 5-day trip to Paris for 2 people in June. We love art, good food, and romantic experiences. Budget is $3000.",
+            height=120,
+            value=default_text,
+            key="trip_input"
+        )
+        
+        # Clear the example text after it's been used
+        if 'example_text' in st.session_state:
+            del st.session_state.example_text
+        
+        # Generate button
+        generate_col1, generate_col2, generate_col3 = st.columns([1, 2, 1])
+        with generate_col2:
+            generate_button = st.button("🚀 Generate My Itinerary", type="primary", use_container_width=True)
+    
+    with col2:
+        # Trip details preview
+        if user_input:
+            st.subheader("🔍 Trip Details Preview")
+            with st.spinner("Analyzing your request..."):
+                details = extract_details(user_input)
                 
-                # Check if this transportation option is already in the list
-                if not any(t.get("details") == transport_text for t in parsed_data["transportation"]):
-                    parsed_data["transportation"].append({
-                        "type": keyword.title(),
-                        "details": transport_text
-                    })
-
-# Helper function to extract attractions
-def extract_attractions(itinerary_text, parsed_data):
-    # First try to extract from a dedicated attractions section
-    attraction_section = re.search(r'(?:Top Attractions|Must-Visit Attractions|Attractions)[\s\S]*?(?=\n#|\Z)', itinerary_text, re.IGNORECASE)
-    if attraction_section:
-        attraction_text = attraction_section.group(0)
-        # Look for numbered or bulleted attraction listings
-        attraction_pattern = r'(?:[\d\*\-]+\.?\s+)([^\n:]+)(?:\s*[:–-]\s*|\n\s*)([\s\S]*?)(?=\n\s*[\d\*\-]+\.|\n#|\Z)'
-        attractions = re.finditer(attraction_pattern, attraction_text)
-        
-        for match in attractions:
-            name = match.group(1).strip()
-            description = match.group(2).strip()
+                if details:
+                    # Create a nice display of extracted details
+                    for key, value in details.items():
+                        if value:
+                            if key == "Destination":
+                                st.write(f"🎯 **{key}:** {value}")
+                            elif key == "Starting Location":
+                                st.write(f"📍 **{key}:** {value}")
+                            elif key == "Trip Duration":
+                                st.write(f"⏰ **{key}:** {value}")
+                            elif key == "Budget Range":
+                                st.write(f"💰 **{key}:** {value}")
+                            elif key == "Number of Travelers":
+                                st.write(f"👥 **{key}:** {value}")
+                            elif key == "Trip Type":
+                                st.write(f"🎨 **{key}:** {value}")
+                            else:
+                                st.write(f"**{key}:** {value}")
+                else:
+                    st.info("Enter your trip details to see the analysis")
+    
+    # Generate itinerary when button is clicked
+    if generate_button and user_input:
+        with st.spinner("🤖 AI is crafting your perfect itinerary... This may take a few moments."):
+            details = extract_details(user_input)
+            itinerary = generate_itinerary(details, user_input)
             
-            # Check if this attraction is already in the list
-            if not any(a.get("name") == name for a in parsed_data["attractions"]):
-                parsed_data["attractions"].append({
-                    "name": name,
-                    "description": description,
-                    "visit_duration": ""
-                })
+            if itinerary:
+                # Store in session state
+                st.session_state.itinerary = itinerary
+                st.session_state.details = details
+                st.session_state.user_input = user_input
+                st.success("🎉 Your itinerary is ready!")
+                st.rerun()
     
-    # Also extract attractions from activities
-    for day in parsed_data["days"]:
-        activities = day.get("activities", [])
-        day_content = day.get("morning", "") + " " + day.get("afternoon", "") + " " + day.get("evening", "")
+    # Display itinerary if available
+    if hasattr(st.session_state, 'itinerary') and st.session_state.itinerary:
+        st.markdown("---")
         
-        # Extract potential attractions from activities and day content
-        potential_attractions = activities.copy()
+        # Parse the itinerary data
+        parsed_data = parse_itinerary_data(st.session_state.itinerary)
         
-        # Add locations mentioned in day content
-        location_pattern = r'(?:Visit|Explore|Tour|See)\s+([^,.]+)'
-        locations = re.finditer(location_pattern, day_content, re.IGNORECASE)
-        for loc_match in locations:
-            location = loc_match.group(1).strip()
-            potential_attractions.append(location)
+        # Create tabs for different sections
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            "📋 Overview", 
+            "📅 Daily Itinerary", 
+            "🏨 Accommodation", 
+            "🍽️ Dining", 
+            "🎯 Attractions", 
+            "💰 Budget", 
+            "ℹ️ Essential Info"
+        ])
         
-        # Process potential attractions
-        for attraction in potential_attractions:
-            # Skip generic activities and meals
-            generic_terms = ["breakfast", "lunch", "dinner", "check-in", "check-out", "hotel", "restaurant"]
-            if any(term in attraction.lower() for term in generic_terms):
-                continue
-            
-            # Check if this attraction is already in the list
-            if not any(a.get("name") == attraction for a in parsed_data["attractions"]):
-                # Try to extract visit duration if available
-                duration_match = re.search(r'(?:spend|duration|for)\s+(\d+(?:\.\d+)?\s*(?:hour|hr|minute|min)s?)', attraction, re.IGNORECASE)
-                visit_duration = duration_match.group(1) if duration_match else ""
-                
-                parsed_data["attractions"].append({
-                    "name": attraction,
-                    "description": "",
-                    "visit_duration": visit_duration
-                })
-
-# Helper function to extract travel tips
-def extract_travel_tips(itinerary_text, parsed_data):
-    tips_section = re.search(r'(?:Travel Tips|Practical Information|Tips|Advice)[\s\S]*?(?=\n#|\Z)', itinerary_text, re.IGNORECASE)
-    if tips_section:
-        tips_text = tips_section.group(0)
-        # Look for numbered or bulleted tips
-        tip_pattern = r'(?:[\*\-•]|\d+\.)\s+([^\n]+)'
-        tips = re.finditer(tip_pattern, tips_text)
-        
-        for match in tips:
-            tip = match.group(1).strip()
-            parsed_data["travel_tips"].append(tip)
-
-# Helper function to extract weather information
-def extract_weather_info(itinerary_text, parsed_data):
-    weather_section = re.search(r'(?:Weather|Climate|Weather Forecast)[\s\S]*?(?=\n#|\Z)', itinerary_text, re.IGNORECASE)
-    if weather_section:
-        weather_text = weather_section.group(0)
-        
-        # Extract temperature ranges
-        temp_pattern = r'(\d+)[°˚]?C?\s*(?:-|to)\s*(\d+)[°˚]?C?'
-        temp_match = re.search(temp_pattern, weather_text)
-        if temp_match:
-            parsed_data["weather"]["temperature_range"] = {
-                "min": int(temp_match.group(1)),
-                "max": int(temp_match.group(2)),
-                "unit": "Celsius"
-            }
-        
-        # Extract temperature in Fahrenheit if available
-        fahrenheit_pattern = r'(\d+)[°˚]?F?\s*(?:-|to)\s*(\d+)[°˚]?F?'
-        fahrenheit_match = re.search(fahrenheit_pattern, weather_text)
-        if fahrenheit_match and "°F" in weather_text:
-            parsed_data["weather"]["temperature_fahrenheit"] = {
-                "min": int(fahrenheit_match.group(1)),
-                "max": int(fahrenheit_match.group(2)),
-                "unit": "Fahrenheit"
-            }
-        
-        # Extract general weather conditions
-        conditions_pattern = r'(?:expect|anticipate|forecast|conditions)[^.]*?([^\.]+)'
-        conditions_match = re.search(conditions_pattern, weather_text, re.IGNORECASE)
-        if conditions_match:
-            parsed_data["weather"]["conditions"] = conditions_match.group(1).strip()
-        
-        # Extract precipitation information
-        precipitation_pattern = r'(?:rain|precipitation|shower)[^.]*?([^\.]+)'
-        precipitation_match = re.search(precipitation_pattern, weather_text, re.IGNORECASE)
-        if precipitation_match:
-            parsed_data["weather"]["precipitation"] = precipitation_match.group(1).strip()
-        
-        # Extract clothing recommendations
-        clothing_pattern = r'(?:wear|bring|pack|clothing)[^.]*?([^\.]+)'
-        clothing_match = re.search(clothing_pattern, weather_text, re.IGNORECASE)
-        if clothing_match:
-            parsed_data["weather"]["clothing_recommendations"] = clothing_match.group(1).strip()
-
-# Function to clean and normalize data before returning final JSON
-def normalize_itinerary_data(parsed_data):
-    """
-    Clean and normalize the extracted data before returning the final JSON.
-    This helps ensure consistent data structure and removes empty fields.
-    """
-    # Remove empty fields from trip_overview
-    if "trip_overview" in parsed_data:
-        parsed_data["trip_overview"] = {k: v for k, v in parsed_data["trip_overview"].items() if v}
-    
-    # Clean up days data
-    for day in parsed_data.get("days", []):
-        # Remove empty meals
-        if "meals" in day:
-            day["meals"] = {k: v for k, v in day["meals"].items() if v}
-            if not day["meals"]:
-                day.pop("meals", None)
-        
-        # Remove empty activities
-        if "activities" in day:
-            day["activities"] = [activity for activity in day["activities"] if activity]
-            if not day["activities"]:
-                day.pop("activities", None)
-        
-        # Remove other empty fields
-        day = {k: v for k, v in day.items() if v or isinstance(v, (int, float))}
-    
-    # Clean up other lists
-    for key in ["attractions", "accommodations", "dining", "transportation", "travel_tips"]:
-        if key in parsed_data:
-            # Remove items that are empty or have empty required fields
-            if key in ["attractions", "accommodations", "dining"]:
-                parsed_data[key] = [item for item in parsed_data[key] if item.get("name")]
+        with tab1:
+            st.header("🌟 Trip Overview")
+            if parsed_data["overview"]:
+                st.markdown(parsed_data["overview"])
             else:
-                parsed_data[key] = [item for item in parsed_data[key] if item]
-    
-    # Clean up weather data
-    if "weather" in parsed_data and not parsed_data["weather"]:
-        parsed_data.pop("weather", None)
-    
-    return parsed_data
-
-# Function to format and save the parsed itinerary to a file
-def save_itinerary_json(parsed_data, output_file=None):
-    """
-    Save the parsed itinerary to a JSON file.
-    
-    Args:
-        parsed_data (dict): The parsed itinerary data
-        output_file (str, optional): Output file path. If None, generates a file name
-                                    based on destination and date.
-    
-    Returns:
-        str: Path to the saved file
-    """
-    import json
-    import os
-    from datetime import datetime
-    
-    # Generate output filename if not provided
-    if not output_file:
-        destination = parsed_data.get("trip_overview", {}).get("destination", "trip")
-        destination = ''.join(c if c.isalnum() else '_' for c in destination)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"itinerary_{destination}_{timestamp}.json"
-    
-    # Ensure directory exists
-    os.makedirs(os.path.dirname(os.path.abspath(output_file)) if os.path.dirname(output_file) else '.', exist_ok=True)
-    
-    # Save to file with pretty formatting
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(parsed_data, f, indent=2, ensure_ascii=False)
-    
-    return output_file
-
-# Function to extract costs and create a budget summary
-def extract_budget_summary(parsed_data):
-    """
-    Extract all costs mentioned in the itinerary and generate a budget summary.
-    
-    Args:
-        parsed_data (dict): The parsed itinerary data
-        
-    Returns:
-        dict: Budget summary with categorized expenses
-    """
-    import re
-    
-    budget_summary = {
-        "accommodation_costs": [],
-        "dining_costs": [],
-        "transportation_costs": [],
-        "attraction_costs": [],
-        "estimated_total": {
-            "min": 0,
-            "max": 0,
-            "currency": "USD"  # Default currency
-        }
-    }
-    
-    # Extract currency symbol if present in any price
-    currency_pattern = r'([$€£₹¥])'
-    all_text = str(parsed_data)
-    currency_matches = re.findall(currency_pattern, all_text)
-    main_currency = max(currency_matches, key=currency_matches.count) if currency_matches else "$"
-    
-    # Function to extract numeric values from price strings
-    def extract_price_range(price_str):
-        # Handle patterns like "$100-$150", "$100 to $150", "100-150 USD", etc.
-        if not price_str:
-            return None
+                st.info("Overview information is being processed...")
             
-        # Extract all numbers
-        nums = re.findall(r'\d+', price_str)
-        if not nums:
-            return None
-            
-        if len(nums) == 1:
-            # Single number found
-            return {"min": int(nums[0]), "max": int(nums[0])}
-        elif len(nums) >= 2:
-            # Range found
-            return {"min": int(nums[0]), "max": int(nums[1])}
-        
-        return None
-    
-    # Extract accommodation costs
-    for acc in parsed_data.get("accommodations", []):
-        price_range = extract_price_range(acc.get("price_range", ""))
-        if price_range:
-            budget_summary["accommodation_costs"].append({
-                "name": acc.get("name", "Accommodation"),
-                "min": price_range["min"],
-                "max": price_range["max"]
-            })
-    
-    # Extract dining costs
-    for dining in parsed_data.get("dining", []):
-        price_range = extract_price_range(dining.get("price_range", ""))
-        if price_range:
-            budget_summary["dining_costs"].append({
-                "name": dining.get("name", dining.get("meal_type", "Meal")),
-                "min": price_range["min"],
-                "max": price_range["max"],
-                "meal_type": dining.get("meal_type", "")
-            })
-    
-    # Extract transportation costs
-    for transport in parsed_data.get("transportation", []):
-        details = transport.get("details", "")
-        # Look for price patterns in transportation details
-        price_match = re.search(r'([$€£₹¥]?\d+(?:\s*-\s*|\s+to\s+)[$€£₹¥]?\d+|[$€£₹¥]\d+)', details)
-        if price_match:
-            price_range = extract_price_range(price_match.group(0))
-            if price_range:
-                budget_summary["transportation_costs"].append({
-                    "type": transport.get("type", "Transportation"),
-                    "min": price_range["min"],
-                    "max": price_range["max"]
-                })
-    
-    # Calculate estimated total
-    min_total = 0
-    max_total = 0
-    
-    for category in ["accommodation_costs", "dining_costs", "transportation_costs", "attraction_costs"]:
-        for item in budget_summary[category]:
-            min_total += item["min"]
-            max_total += item["max"]
-    
-    budget_summary["estimated_total"]["min"] = min_total
-    budget_summary["estimated_total"]["max"] = max_total
-    budget_summary["estimated_total"]["currency"] = main_currency
-    
-    # Add to the main parsed data if anything was found
-    if min_total > 0 or max_total > 0:
-        if "trip_overview" not in parsed_data:
-            parsed_data["trip_overview"] = {}
-        parsed_data["trip_overview"]["budget_summary"] = budget_summary
-    
-    return budget_summary
-
-# Main function to process itineraries
-# Main function to process itineraries
-def process_itinerary(itinerary_text, output_file=None, include_budget_summary=True):
-    """
-    Process an itinerary text to extract structured data and optionally save to a file.
-    
-    Args:
-        itinerary_text (str): The raw itinerary text to process
-        output_file (str, optional): Path to save the JSON output. If None, doesn't save to file.
-        include_budget_summary (bool): Whether to include budget analysis in the output
-        
-    Returns:
-        dict: The structured itinerary data with all extracted information
-    """
-    import json
-    import re
-    
-    # Parse the itinerary text into structured data
-    parsed_data = parse_itinerary(itinerary_text)
-    
-    # Generate budget summary if requested
-    if include_budget_summary:
-        budget_summary = extract_budget_summary(parsed_data)
-        # Budget summary is already added to parsed_data in the extract_budget_summary function
-    
-    # Save to file if output_file is specified
-    if output_file:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(parsed_data, f, indent=2)
-            
-    return parsed_data
-
-def parse_itinerary(itinerary_text):
-    """
-    Parse raw itinerary text into structured data.
-    
-    Args:
-        itinerary_text (str): The raw itinerary text to process
-        
-    Returns:
-        dict: Structured itinerary data
-    """
-    import re
-    
-    # Initialize structured data dictionary
-    parsed_data = {
-        "trip_overview": {},
-        "daily_schedule": [],
-        "accommodations": [],
-        "transportation": [],
-        "dining": [],
-        "attractions": []
-    }
-    
-    # Extract trip title and dates
-    title_match = re.search(r'^(.*?)(?:Itinerary|Trip|Tour)', itinerary_text, re.IGNORECASE | re.MULTILINE)
-    if title_match:
-        parsed_data["trip_overview"]["title"] = title_match.group(1).strip()
-    
-    # Extract dates
-    date_pattern = r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s+\d{4}|\w+\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4})'
-    date_matches = re.findall(date_pattern, itinerary_text[:500])  # Look only in the beginning
-    if len(date_matches) >= 2:
-        parsed_data["trip_overview"]["start_date"] = date_matches[0]
-        parsed_data["trip_overview"]["end_date"] = date_matches[1]
-    
-    # Extract daily schedules
-    day_patterns = [
-        r'Day\s+(\d+)[:\s]+(.+?)(?=Day\s+\d+:|$)',
-        r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+)(?:\s+\d{4})?[:\s]+(.+?)(?=\d{1,2}(?:st|nd|rd|th)?\s+\w+(?:\s+\d{4})?[:\s]+|$)'
-    ]
-    
-    for pattern in day_patterns:
-        day_matches = re.findall(pattern, itinerary_text, re.DOTALL)
-        if day_matches:
-            for day_num, day_content in day_matches:
-                day_data = {"day": day_num.strip(), "activities": []}
+            # Display key trip details
+            if hasattr(st.session_state, 'details'):
+                st.subheader("📊 Trip Summary")
+                details_df_data = []
+                for key, value in st.session_state.details.items():
+                    if value:
+                        details_df_data.append({"Detail": key, "Information": str(value)})
                 
-                # Extract activities from the day
-                activity_blocks = re.split(r'\n{2,}', day_content.strip())
-                for block in activity_blocks:
-                    if block.strip():
-                        time_match = re.search(r'(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?)', block)
-                        time = time_match.group(1) if time_match else None
-                        
-                        activity = {
-                            "time": time,
-                            "description": block.strip()
-                        }
-                        day_data["activities"].append(activity)
-                
-                parsed_data["daily_schedule"].append(day_data)
-            break  # Use the first successful pattern
-    
-    # Extract accommodations
-    accommodation_patterns = [
-        r'(?:Accommodation|Hotel|Stay|Lodging)[:\s]+(.+?)(?=\n\n|\n[A-Z])',
-        r'(?:Night at|Stay at|Hotel)[:\s]+(.+?)(?=\n\n|\n[A-Z])'
-    ]
-    
-    for pattern in accommodation_patterns:
-        acc_matches = re.findall(pattern, itinerary_text, re.DOTALL)
-        for match in acc_matches:
-            lines = match.strip().split('\n')
-            name = lines[0].strip()
-            details = '\n'.join(lines[1:]).strip() if len(lines) > 1 else ""
-            
-            # Extract price if mentioned
-            price_match = re.search(r'([$€£₹¥]?\d+(?:\s*-\s*|\s+to\s+)[$€£₹¥]?\d+|[$€£₹¥]\d+)(?:\s*per\s*night)?', match)
-            price_range = price_match.group(0) if price_match else None
-            
-            parsed_data["accommodations"].append({
-                "name": name,
-                "details": details,
-                "price_range": price_range
-            })
-    
-    # Extract transportation
-    transport_patterns = [
-        r'(?:Transport|Transportation|Travel)[:\s]+(.+?)(?=\n\n|\n[A-Z])',
-        r'(?:By|Via|Flight|Train|Bus|Car)[:\s]+(.+?)(?=\n\n|\n[A-Z])'
-    ]
-    
-    for pattern in transport_patterns:
-        transport_matches = re.findall(pattern, itinerary_text, re.DOTALL)
-        for match in transport_matches:
-            transport_type = re.search(r'(Flight|Train|Bus|Car|Taxi|Ferry|Transfer)', match, re.IGNORECASE)
-            type_str = transport_type.group(1) if transport_type else "Transportation"
-            
-            parsed_data["transportation"].append({
-                "type": type_str,
-                "details": match.strip()
-            })
-    
-    # Extract dining information
-    dining_patterns = [
-        r'(?:Breakfast|Lunch|Dinner|Meal)[:\s]+(.+?)(?=\n\n|\n[A-Z])',
-        r'(?:Eat at|Dining at|Restaurant)[:\s]+(.+?)(?=\n\n|\n[A-Z])'
-    ]
-    
-    for pattern in dining_patterns:
-        dining_matches = re.findall(pattern, itinerary_text, re.DOTALL)
-        for match in dining_matches:
-            meal_type = re.search(r'(Breakfast|Lunch|Dinner|Brunch)', match, re.IGNORECASE)
-            meal_type_str = meal_type.group(1) if meal_type else "Meal"
-            
-            lines = match.strip().split('\n')
-            name = lines[0].strip()
-            details = '\n'.join(lines[1:]).strip() if len(lines) > 1 else ""
-            
-            # Extract price if mentioned
-            price_match = re.search(r'([$€£₹¥]?\d+(?:\s*-\s*|\s+to\s+)[$€£₹¥]?\d+|[$€£₹¥]\d+)', match)
-            price_range = price_match.group(0) if price_match else None
-            
-            parsed_data["dining"].append({
-                "meal_type": meal_type_str,
-                "name": name,
-                "details": details,
-                "price_range": price_range
-            })
-    
-    # Extract attractions/activities
-    attraction_patterns = [
-        r'(?:Visit|Tour|Sightseeing|Explore|Attraction)[:\s]+(.+?)(?=\n\n|\n[A-Z])',
-        r'(?:Activity|Experience)[:\s]+(.+?)(?=\n\n|\n[A-Z])'
-    ]
-    
-    for pattern in attraction_patterns:
-        attraction_matches = re.findall(pattern, itinerary_text, re.DOTALL)
-        for match in attraction_matches:
-            lines = match.strip().split('\n')
-            name = lines[0].strip()
-            details = '\n'.join(lines[1:]).strip() if len(lines) > 1 else ""
-            
-            # Extract price if mentioned
-            price_match = re.search(r'([$€£₹¥]?\d+(?:\s*-\s*|\s+to\s+)[$€£₹¥]?\d+|[$€£₹¥]\d+)', match)
-            price_range = price_match.group(0) if price_match else None
-            
-            parsed_data["attractions"].append({
-                "name": name,
-                "details": details,
-                "price_range": price_range
-            })
-    
-    return parsed_data
-def enhance_prompt_for_structured_output(prompt):
-    return prompt + """
-    
-    IMPORTANT: Along with the human-readable itinerary, please include a structured JSON summary at the end of your response in the following format (enclosed in ```json tags):
-    
-    ```json
-    {
-      "trip_overview": {
-        "destination": "destination name",
-        "duration_days": number,
-        "trip_type": "type of trip",
-        "budget_range": "budget information"
-      },
-      "days": [
-        {
-          "day_number": 1,
-          "date": "YYYY-MM-DD",
-          "title": "Day title/theme",
-          "morning": "Morning activities",
-          "afternoon": "Afternoon activities",
-          "evening": "Evening activities",
-          "meals": {
-            "breakfast": "Breakfast details",
-            "lunch": "Lunch details",
-            "dinner": "Dinner details"
-          },
-          "accommodation": "Accommodation details"
-        }
-      ],
-      "attractions": [
-        {
-          "name": "Attraction name",
-          "description": "Description of attraction",
-          "visit_duration": "Estimated time to visit"
-        }
-      ],
-      "accommodations": [
-        {
-          "name": "Accommodation name",
-          "description": "Description",
-          "price_range": "Price information"
-        }
-      ],
-      "dining": [
-        {
-          "name": "Restaurant name 1",
-          "cuisine": "Cuisine type 1",
-          "price_range": "Price range 1",
-          "meal_type": "Meal type 1"
-        },
-        {
-          "name": "Restaurant name 2",
-          "cuisine": "Cuisine type 2",
-          "price_range": "Price range 2",
-          "meal_type": "Meal type 2"
-        }
-      ],
-      "transportation": [
-        {
-          "type": "Transportation type",
-          "details": "Details and recommendations"
-        }
-      ],
-      "travel_tips": [
-        "Tip 1",
-        "Tip 2"
-      ],
-      "budget": {
-        "total_estimated_cost": "estimated total cost",
-        "accommodation_cost": "estimated accommodation costs",
-        "food_cost": "estimated food costs",
-        "transportation_cost": "estimated transportation costs",
-        "activities_cost": "estimated activities/attractions costs",
-        "miscellaneous_cost": "estimated miscellaneous costs"
-      },
-      "essential_info": {
-        "visa_requirements": "visa details",
-        "emergency_contacts": "emergency numbers",
-        "local_customs": "important local customs to be aware of",
-        "safety_tips": "safety information",
-        "language": "local language information",
-        "currency_exchange": "currency exchange information"
-      },
-      "weather": {
-        "temperature_range": {
-          "min": 0,
-          "max": 30,
-          "unit": "Celsius"
-        },
-        "conditions": "Weather conditions description",
-        "clothing": "Clothing recommendations"
-      }
-    }
-    ```
-    
-    CRITICAL JSON SYNTAX REQUIREMENTS:
-    
-    1. COMMAS: Include commas BETWEEN array elements and object properties, but NOT after the last element in an array or object.
-       ✓ CORRECT:   [{"name": "Place 1"}, {"name": "Place 2"}]
-       ✗ INCORRECT: [{"name": "Place 1"} {"name": "Place 2"}]
-       ✗ INCORRECT: [{"name": "Place 1"}, {"name": "Place 2"},]
-    
-    2. BRACKETS: Every opening bracket or brace must have a matching closing bracket or brace.
-       - Array: [ ]
-       - Object: { }
-    
-    3. CONSISTENCY: Use consistent indentation for better readability.
-    
-    4. QUOTING: All property names and string values must be enclosed in double quotes.
-       ✓ CORRECT:   {"name": "Place"}
-       ✗ INCORRECT: {name: "Place"}
-       ✗ INCORRECT: {'name': 'Place'}
-    
-    5. COMPLETENESS: Include ALL relevant items in the arrays. Do not truncate the data or use placeholders.
-    
-    6. SCHEMA: Follow the exact schema structure provided above.
-    
-    7. DATA TYPES: Use appropriate data types:
-       - Strings: Use quotes (e.g., "Barcelona")
-       - Numbers: No quotes (e.g., 25)
-       - Arrays: Square brackets (e.g., [ ])
-       - Objects: Curly braces (e.g., { })
-    
-    Please structure your response using clear section headers for each day (Day 1, Day 2, etc.), and clearly mark morning, afternoon, and evening activities as well as meals and accommodations to facilitate accurate JSON extraction.
-    """
-
-def display_itinerary_tabs(itinerary_json):
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "🌍 Overview", "📅 Itinerary", "🏨 Accommodation", 
-        "🍽️ Dining", "🎯 Attractions", "💰 Budget", "ℹ️ Essential Info"
-    ])
-    
-    # Overview Tab
-    with tab1:
-        st.markdown("<h2 style='text-align: center;'>Trip Overview</h2>", unsafe_allow_html=True)
-        overview = itinerary_json.get("trip_overview", {})
+                if details_df_data:
+                    try:
+                        details_df = pd.DataFrame(details_df_data)
+                        st.dataframe(details_df, use_container_width=True, hide_index=True)
+                    except Exception as e:
+                        # Fallback to simple display if DataFrame creation fails
+                        for item in details_df_data:
+                            st.write(f"**{item['Detail']}:** {item['Information']}")
         
-        # Create three columns for better organization
-        col1, col2, col3 = st.columns([1, 1, 1])
+        with tab2:
+            st.header("📅 Daily Itinerary")
+            
+            if parsed_data["days"]:
+                for day in parsed_data["days"]:
+                    with st.expander(f"🗓️ {day['title']}", expanded=False):
+                        display_day_details(day)
+            else:
+                st.info("Daily itinerary is being processed...")
+                # Show raw itinerary as fallback
+                if st.session_state.itinerary:
+                    daily_section = re.search(r'##\s*2\.\s*Daily Itinerary(.*?)(?=##\s*3\.|$)', st.session_state.itinerary, re.DOTALL | re.IGNORECASE)
+                    if daily_section:
+                        st.markdown(daily_section.group(1).strip())
+        
+        with tab3:
+            st.header("🏨 Accommodation Recommendations")
+            if parsed_data["accommodation"]:
+                st.markdown(parsed_data["accommodation"])
+            else:
+                st.info("Accommodation recommendations are being processed...")
+                # Extract and show accommodation info as fallback
+                accommodation_section = re.search(r'##\s*3\.\s*Accommodation(.*?)(?=##\s*4\.|$)', st.session_state.itinerary, re.DOTALL | re.IGNORECASE)
+                if accommodation_section:
+                    st.markdown(accommodation_section.group(1).strip())
+        
+        with tab4:
+            st.header("🍽️ Dining Recommendations")
+            if parsed_data["dining"]:
+                st.markdown(parsed_data["dining"])
+            else:
+                st.info("Dining recommendations are being processed...")
+                # Extract and show dining info as fallback
+                dining_section = re.search(r'##\s*4\.\s*Dining(.*?)(?=##\s*5\.|$)', st.session_state.itinerary, re.DOTALL | re.IGNORECASE)
+                if dining_section:
+                    st.markdown(dining_section.group(1).strip())
+        
+        with tab5:
+            st.header("🎯 Attractions & Activities")
+            if parsed_data["attractions"]:
+                st.markdown(parsed_data["attractions"])
+            else:
+                st.info("Attractions and activities are being processed...")
+                # Extract and show attractions info as fallback
+                attractions_section = re.search(r'##\s*5\.\s*Attractions(.*?)(?=##\s*6\.|$)', st.session_state.itinerary, re.DOTALL | re.IGNORECASE)
+                if attractions_section:
+                    st.markdown(attractions_section.group(1).strip())
+        
+        with tab6:
+            st.header("💰 Budget Breakdown")
+            if parsed_data["budget"]:
+                st.markdown(parsed_data["budget"])
+            else:
+                st.info("Budget breakdown is being processed...")
+                # Extract and show budget info as fallback
+                budget_section = re.search(r'##\s*6\.\s*Budget(.*?)(?=##\s*7\.|$)', st.session_state.itinerary, re.DOTALL | re.IGNORECASE)
+                if budget_section:
+                    st.markdown(budget_section.group(1).strip())
+        
+        with tab7:
+            st.header("ℹ️ Essential Travel Information")
+            if parsed_data["essential_info"]:
+                st.markdown(parsed_data["essential_info"])
+            else:
+                st.info("Essential information is being processed...")
+                # Extract and show essential info as fallback
+                essential_section = re.search(r'##\s*7\.\s*Essential(.*?)$', st.session_state.itinerary, re.DOTALL | re.IGNORECASE)
+                if essential_section:
+                    st.markdown(essential_section.group(1).strip())
+            
+            # Add transportation info if available
+            if parsed_data["transportation"]:
+                st.subheader("🚗 Transportation Details")
+                st.markdown(parsed_data["transportation"])
+        
+        # Download options
+        st.markdown("---")
+        st.header("📥 Download Your Itinerary")
+        
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.markdown("""
-                <div style='background-color: #E3F2FD; padding: 1rem; border-radius: 10px;'>
-                    <h3 style='color: #1E88E5; margin: 0;'>🌍 Destination</h3>
-                    <p style='font-size: 1.2rem; margin: 0.5rem 0;'>{}</p>
-                </div>
-            """.format(overview.get("destination", "Not specified")), unsafe_allow_html=True)
-            
-            st.markdown("""
-                <div style='background-color: #E8F5E9; padding: 1rem; border-radius: 10px; margin-top: 1rem;'>
-                    <h3 style='color: #43A047; margin: 0;'>⏱️ Duration</h3>
-                    <p style='font-size: 1.2rem; margin: 0.5rem 0;'>{} days</p>
-                </div>
-            """.format(overview.get("duration_days", "Not specified")), unsafe_allow_html=True)
+            # Text download
+            st.download_button(
+                label="📄 Download as Text",
+                data=st.session_state.itinerary,
+                file_name=f"travel_itinerary_{datetime.now().strftime('%Y%m%d')}.txt",
+                mime="text/plain"
+            )
         
         with col2:
-            days = itinerary_json.get("days", [])
-            if days:
-                start_date = days[0].get("date", "Not specified")
-                end_date = days[-1].get("date", "Not specified")
-            else:
-                start_date = overview.get("start_date", "Not specified")
-                end_date = overview.get("end_date", "Not specified")
+            # JSON download for structured data
+            json_data = {
+                "user_input": st.session_state.user_input,
+                "extracted_details": st.session_state.details,
+                "itinerary": st.session_state.itinerary,
+                "parsed_data": parsed_data,
+                "generated_date": datetime.now().isoformat()
+            }
             
-            st.markdown("""
-                <div style='background-color: #FFF3E0; padding: 1rem; border-radius: 10px;'>
-                    <h3 style='color: #EF6C00; margin: 0;'>📅 Travel Dates</h3>
-                    <p style='margin: 0.5rem 0;'><b>Start:</b> {}</p>
-                    <p style='margin: 0.5rem 0;'><b>End:</b> {}</p>
-                </div>
-            """.format(start_date, end_date), unsafe_allow_html=True)
+            st.download_button(
+                label="📊 Download as JSON",
+                data=json.dumps(json_data, indent=2),
+                file_name=f"travel_data_{datetime.now().strftime('%Y%m%d')}.json",
+                mime="application/json"
+            )
         
         with col3:
-            st.markdown("""
-                <div style='background-color: #F3E5F5; padding: 1rem; border-radius: 10px;'>
-                    <h3 style='color: #8E24AA; margin: 0;'>💰 Budget Range</h3>
-                    <p style='font-size: 1.2rem; margin: 0.5rem 0;'>{}</p>
-                </div>
-            """.format(overview.get("budget_range", "Not specified")), unsafe_allow_html=True)
-        
-        # Weather information
-        st.markdown("""
-            <div style='background-color: #E1F5FE; padding: 1.5rem; border-radius: 10px; margin-top: 2rem;'>
-                <h3 style='color: #0288D1; margin: 0;'>🌤️ Weather Information</h3>
-        """, unsafe_allow_html=True)
-        
-        weather = itinerary_json.get("weather", {})
-        if weather:
-            temp_range = weather.get("temperature_range", {})
-            if temp_range:
-                st.markdown(f"""
-                    <p style='margin: 0.5rem 0;'><b>Temperature:</b> {temp_range.get('min')}°{temp_range.get('unit', 'C')} to {temp_range.get('max')}°{temp_range.get('unit', 'C')}</p>
-                    <p style='margin: 0.5rem 0;'><b>Conditions:</b> {weather.get('conditions', 'Not specified')}</p>
-                    <p style='margin: 0.5rem 0;'><b>What to Wear:</b> {weather.get('clothing_recommendations', 'Not specified')}</p>
-                """, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        
-        # Best Time to Visit
-        st.markdown("""
-            <div style='background-color: #F5F5F5; padding: 1.5rem; border-radius: 10px; margin-top: 2rem;'>
-                <h3 style='color: #424242; margin: 0;'>📅 Best Time to Visit</h3>
-                <p style='margin: 0.5rem 0;'>{}</p>
-            </div>
-        """.format(itinerary_json.get("essential_info", {}).get("best_time_to_visit", "Not specified")), unsafe_allow_html=True)
-
-    # Itinerary Tab
-    with tab2:
-        st.markdown("<h2 style='text-align: center;'>Daily Itinerary</h2>", unsafe_allow_html=True)
-        days = itinerary_json.get("days", [])
-        for day in days:
-            with st.expander(f"Day {day.get('day_number')} - {day.get('title', '')}"):
-                st.markdown("""
-                    <div style='background-color: #E3F2FD; padding: 1rem; border-radius: 10px; margin: 0.5rem 0;'>
-                        <h3 style='color: #1E88E5; margin: 0;'>Morning</h3>
-                        <p>{}</p>
-                        <h3 style='color: #1E88E5; margin-top: 1rem;'>Afternoon</h3>
-                        <p>{}</p>
-                        <h3 style='color: #1E88E5; margin-top: 1rem;'>Evening</h3>
-                        <p>{}</p>
-                    </div>
-                """.format(
-                    day.get("morning", "No activities specified"),
-                    day.get("afternoon", "No activities specified"),
-                    day.get("evening", "No activities specified")
-                ), unsafe_allow_html=True)
-                
-                meals = day.get("meals", {})
-                st.markdown("""
-                    <div style='background-color: #FFF3E0; padding: 1rem; border-radius: 10px; margin: 0.5rem 0;'>
-                        <h3 style='color: #EF6C00; margin: 0;'>Meals</h3>
-                        <p><b>Breakfast:</b> {}</p>
-                        <p><b>Lunch:</b> {}</p>
-                        <p><b>Dinner:</b> {}</p>
-                    </div>
-                """.format(
-                    meals.get("breakfast", "Not specified"),
-                    meals.get("lunch", "Not specified"),
-                    meals.get("dinner", "Not specified")
-                ), unsafe_allow_html=True)
-                
-                st.markdown("""
-                    <div style='background-color: #E8F5E9; padding: 1rem; border-radius: 10px; margin: 0.5rem 0;'>
-                        <h3 style='color: #43A047; margin: 0;'>Accommodation</h3>
-                        <p>{}</p>
-                    </div>
-                """.format(day.get("accommodation", "Not specified")), unsafe_allow_html=True)
-
-    # Accommodation Tab
-    with tab3:
-        st.markdown("<h2 style='text-align: center;'>Accommodations</h2>", unsafe_allow_html=True)
-        accommodations = itinerary_json.get("accommodations", [])
-        for acc in accommodations:
-            with st.expander(acc.get("name", "Unnamed Accommodation")):
-                st.markdown("""
-                    <div style='background-color: #E3F2FD; padding: 1rem; border-radius: 10px;'>
-                        <p><b>Price Range:</b> {}</p>
-                        <p><b>Description:</b> {}</p>
-                    </div>
-                """.format(
-                    acc.get("price_range", "Not specified"),
-                    acc.get("description", "No description available")
-                ), unsafe_allow_html=True)
-
-    # Dining Tab
-    with tab4:
-        st.markdown("<h2 style='text-align: center;'>Dining Recommendations</h2>", unsafe_allow_html=True)
-        dining = itinerary_json.get("dining", [])
-        for restaurant in dining:
-            with st.expander(restaurant.get("name", "Unnamed Restaurant")):
-                st.markdown("""
-                    <div style='background-color: #FFF3E0; padding: 1rem; border-radius: 10px;'>
-                        <p><b>Cuisine:</b> {}</p>
-                        <p><b>Price Range:</b> {}</p>
-                        <p><b>Meal Type:</b> {}</p>
-                    </div>
-                """.format(
-                    restaurant.get("cuisine", "Not specified"),
-                    restaurant.get("price_range", "Not specified"),
-                    restaurant.get("meal_type", "Not specified")
-                ), unsafe_allow_html=True)
-
-    # Attractions Tab
-    with tab5:
-        st.markdown("<h2 style='text-align: center;'>Top Attractions</h2>", unsafe_allow_html=True)
-        attractions = itinerary_json.get("attractions", [])
-        for attraction in attractions:
-            with st.expander(attraction.get("name", "Unnamed Attraction")):
-                st.markdown("""
-                    <div style='background-color: #E8F5E9; padding: 1rem; border-radius: 10px;'>
-                        <p><b>Description:</b> {}</p>
-                        <p><b>Visit Duration:</b> {}</p>
-                    </div>
-                """.format(
-                    attraction.get("description", "No description available"),
-                    attraction.get("visit_duration", "Not specified")
-                ), unsafe_allow_html=True)
-
-    # Budget Tab
-    with tab6:
-        st.markdown("<h2 style='text-align: center;'>Budget Breakdown</h2>", unsafe_allow_html=True)
-        budget = itinerary_json.get("budget", {})
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("""
-                <div style='background-color: #E3F2FD; padding: 1rem; border-radius: 10px;'>
-                    <h3 style='color: #1E88E5; margin: 0;'>Total Cost</h3>
-                    <p style='font-size: 1.2rem;'>{}</p>
-                    <h3 style='color: #1E88E5; margin-top: 1rem;'>Accommodation</h3>
-                    <p>{}</p>
-                    <h3 style='color: #1E88E5; margin-top: 1rem;'>Food</h3>
-                    <p>{}</p>
-                </div>
-            """.format(
-                budget.get("total_estimated_cost", "Not specified"),
-                budget.get("accommodation_cost", "Not specified"),
-                budget.get("food_cost", "Not specified")
-            ), unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown("""
-                <div style='background-color: #FFF3E0; padding: 1rem; border-radius: 10px;'>
-                    <h3 style='color: #EF6C00; margin: 0;'>Transportation</h3>
-                    <p>{}</p>
-                    <h3 style='color: #EF6C00; margin-top: 1rem;'>Activities</h3>
-                    <p>{}</p>
-                    <h3 style='color: #EF6C00; margin-top: 1rem;'>Miscellaneous</h3>
-                    <p>{}</p>
-                </div>
-            """.format(
-                budget.get("transportation_cost", "Not specified"),
-                budget.get("activities_cost", "Not specified"),
-                budget.get("miscellaneous_cost", "Not specified")
-            ), unsafe_allow_html=True)
-
-    # Essential Info Tab
-    with tab7:
-        st.markdown("<h2 style='text-align: center;'>Essential Information</h2>", unsafe_allow_html=True)
-        essential_info = itinerary_json.get("essential_info", {})
-        
-        # Travel Tips
-        st.markdown("<h3 style='color: #1E88E5;'>💡 Travel Tips</h3>", unsafe_allow_html=True)
-        tips = itinerary_json.get("travel_tips", [])
-        for tip in tips:
-            st.markdown(f"• {tip}")
-        
-        # Essential Information Cards
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("""
-                <div style='background-color: #E3F2FD; padding: 1rem; border-radius: 10px; margin: 0.5rem 0;'>
-                    <h3 style='color: #1E88E5; margin: 0;'>📋 Important Information</h3>
-                    <p style='margin: 0.5rem 0;'><b>🛂 Visa:</b> {}</p>
-                    <p style='margin: 0.5rem 0;'><b>🆘 Emergency:</b> {}</p>
-                    <p style='margin: 0.5rem 0;'><b>🏺 Local Customs:</b> {}</p>
-                </div>
-            """.format(
-                essential_info.get("visa_requirements", "Not specified"),
-                essential_info.get("emergency_contacts", "Not specified"),
-                essential_info.get("local_customs", "Not specified")
-            ), unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown("""
-                <div style='background-color: #FFF3E0; padding: 1rem; border-radius: 10px; margin: 0.5rem 0;'>
-                    <h3 style='color: #EF6C00; margin: 0;'>🔍 Additional Information</h3>
-                    <p style='margin: 0.5rem 0;'><b>🛡️ Safety:</b> {}</p>
-                    <p style='margin: 0.5rem 0;'><b>🗣️ Language:</b> {}</p>
-                    <p style='margin: 0.5rem 0;'><b>💱 Currency:</b> {}</p>
-                </div>
-            """.format(
-                essential_info.get("safety_tips", "Not specified"),
-                essential_info.get("language", "Not specified"),
-                essential_info.get("currency_exchange", "Not specified")
-            ), unsafe_allow_html=True)
-
-def main():
-    st.title("Travel Plan Extractor")
-    user_input = st.text_area("Enter your travel details:")
-    if st.button("Plan my Trip", type='primary'):
-        if user_input:
-            details = extract_details(user_input)
-            
-            # Create a pandas DataFrame for table presentation
-            details_df = pd.DataFrame(details.items(), columns=["Detail", "Value"])
-            details_df.index = details_df.index + 1
-            st.subheader("Extracted Travel Details")
-            st.table(details_df)
-            details_json = extract_details(user_input)
-        
-            # Display JSON output of user details
-            with st.expander("View Extracted Travel Details (JSON)", expanded=False):
-                st.json(details_json) 
-            
-            # Generate and display the itinerary prompt
-            prompt = generate_prompt(details)
-            # Enhance prompt to get structured output
-            structured_prompt = enhance_prompt_for_structured_output(prompt)
-            
-            with st.expander("View Itinerary Request Prompt", expanded=False):
-                st.write(prompt)
-            
-            # Check for errors
-            error_messages = ["Error❗Error❗Error❗", "Failed to generate", "Invalid input"]
-            if not any(error in prompt for error in error_messages):
-                with st.spinner("Generating detailed itinerary with Google Gemini..."): 
-                    itinerary_text = generate_itinerary_with_gemini(structured_prompt)  
-                with st.expander("View Full Itinerary Text", expanded=False):
-                    st.markdown(itinerary_text)
-                # Extract structured JSON data from the itinerary
-                with st.spinner("Extracting structured data from itinerary..."):
-                    itinerary_json = extract_itinerary_json(itinerary_text)
-                with st.expander("View Raw JSON Data", expanded=False):
-                    st.json(itinerary_json)
-                # Display the itinerary in tabs
-                display_itinerary_tabs(itinerary_json)
-                
-                # Add download buttons
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        label="Download Itinerary Text",
-                        data=itinerary_text,
-                        file_name="travel_itinerary.txt",
-                        mime="text/plain"
-                    )
-                with col2:
-                    st.download_button(
-                        label="Download Itinerary JSON",
-                        data=json.dumps(itinerary_json, indent=2),
-                        file_name="travel_itinerary.json",
-                        mime="application/json"
-                    )
-            else:
-                st.warning("An error occurred in itinerary generation. Please check your input and try again.")
-        else:
-            st.warning("Please enter some text to extract details.")
-    
-    # Footer
-    st.markdown("---")
-    st.markdown("### 💡 Tips")
-    st.markdown("""
-    - Be specific about dates, locations, and number of travelers
-    - Include budget information if available
-    - Mention transportation and accommodation preferences
-    - Add any special requirements or considerations
-    """)
+            # Clear session to start over
+            if st.button("🔄 Plan Another Trip", type="secondary"):
+                # Clear session state
+                for key in ['itinerary', 'details', 'user_input']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
 
 if __name__ == "__main__":
     main()
